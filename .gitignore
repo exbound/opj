@@ -1,0 +1,22 @@
+# Agent/editor local state
+.claude/
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local test fixtures that must not be committed (vendor samples).
+tests/fixtures/_local/

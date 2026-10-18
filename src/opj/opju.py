@@ -1,0 +1,215 @@
+"""Reader for Origin ``.opju`` project files.
+
+Implements the format described in ``docs/engineering-spec.md``. The body is a
+tag/length/value byte stream read by a forward cursor; text and short scalar
+records use ``[tag 0x80-0x9F][length byte][payload]`` framing, interleaved with
+opaque embedded-asset regions (preview thumbnail, images) that this reader does
+not yet decode and instead records as gaps.
+
+Everything here is derived from the functional specification and the observable
+bytes of publicly published sample files.
+"""
+
+from __future__ import annotations
+
+import struct
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# --- format constants (see docs/engineering-spec.md) -----------------------
+
+MAGIC_FAMILY_PREFIX = b"CPY"
+#: The Unicode .opju header magic token.
+MAGIC_OPJU = b"CPYUA"
+#: Length of the per-document root header that precedes the record stream.
+ROOT_HEADER_LEN = 7
+#: Bytes [2:6] of the root header are constant across documents.
+ROOT_HEADER_CONST = bytes((0x6C, 0xC0, 0x11, 0x01))
+#: Inclusive tag range for length-prefixed value records (text / short scalar).
+TAG_VALUE_MIN = 0x80
+TAG_VALUE_MAX = 0x9F
+#: ASCII marker that introduces the embedded preview thumbnail.
+PREVIEW_MARKER = b"PrvwOPJU"
+
+
+class OpjError(Exception):
+    """Raised when a buffer is not a recognizable Origin project file."""
+
+
+@dataclass(frozen=True)
+class Header:
+    """The parsed header line and the offset where the body begins."""
+
+    magic: str
+    format_version: str
+    object_count: int
+    body_offset: int  # offset of the first body byte (after the header newline)
+
+
+@dataclass(frozen=True)
+class Record:
+    """One length-prefixed value record from the tag/length/value stream."""
+
+    offset: int
+    tag: int
+    length: int
+    payload: bytes
+
+    @property
+    def is_text(self) -> bool:
+        """True if the payload is entirely printable, non-NUL bytes."""
+        return len(self.payload) > 0 and all(0x20 <= b < 0x7F for b in self.payload)
+
+    @property
+    def text(self) -> str | None:
+        """The payload decoded as text, or ``None`` if it is not text."""
+        if not self.is_text:
+            return None
+        return self.payload.decode("latin-1")
+
+    def as_u16(self) -> int | None:
+        return struct.unpack("<H", self.payload)[0] if self.length == 2 else None
+
+    def as_u32(self) -> int | None:
+        return struct.unpack("<I", self.payload)[0] if self.length == 4 else None
+
+    def as_f64(self) -> float | None:
+        return struct.unpack("<d", self.payload)[0] if self.length == 8 else None
+
+
+@dataclass
+class Document:
+    """The result of parsing an Origin project file."""
+
+    header: Header
+    root_header: bytes
+    #: Records of the clean document-header TLV (from body+7 to the first gap).
+    header_records: list[Record] = field(default_factory=list)
+    #: Length-prefixed text records recovered by a global scan (object names,
+    #: comments). Robust to the opaque regions that interrupt a linear walk.
+    names: list[Record] = field(default_factory=list)
+    #: (offset, note) for regions the reader does not yet decode.
+    gaps: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def name_strings(self) -> list[str]:
+        return [r.text for r in self.names if r.text is not None]
+
+
+# --- parsing ---------------------------------------------------------------
+
+
+def parse_header(data: bytes) -> Header:
+    """Parse the ASCII header line. Raises :class:`OpjError` if absent."""
+    if not data.startswith(MAGIC_FAMILY_PREFIX):
+        raise OpjError("not an Origin project file: missing CPY* magic")
+    nl = data.find(b"\n")
+    if nl < 0:
+        raise OpjError("truncated: no header-line terminator")
+    line = data[:nl].decode("latin-1")
+    parts = line.split()
+    if len(parts) < 3:
+        raise OpjError(f"unexpected header line: {line!r}")
+    magic, version, count = parts[0], parts[1], parts[2]
+    try:
+        object_count = int(count)
+    except ValueError as exc:
+        raise OpjError(f"header object-count not an integer: {count!r}") from exc
+    return Header(
+        magic=magic,
+        format_version=version,
+        object_count=object_count,
+        body_offset=nl + 1,
+    )
+
+
+def root_header(data: bytes, header: Header) -> bytes:
+    """Return the 7-byte per-document root header that precedes the stream."""
+    start = header.body_offset
+    end = start + ROOT_HEADER_LEN
+    if end > len(data):
+        raise OpjError("truncated: body shorter than the root header")
+    return data[start:end]
+
+
+def iter_header_records(data: bytes, start: int) -> Iterator[Record]:
+    """Yield value records from ``start`` until the first non-value tag.
+
+    Walks the clean document-header TLV. Stops at the first byte that is not a
+    ``0x80-0x9F`` tag (the first opaque / embedded-asset region).
+    """
+    i = start
+    n = len(data)
+    while i + 1 < n:
+        tag = data[i]
+        if not (TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX):
+            return
+        length = data[i + 1]
+        payload = data[i + 2 : i + 2 + length]
+        if len(payload) < length:  # truncated
+            return
+        yield Record(offset=i, tag=tag, length=length, payload=payload)
+        i += 2 + length
+
+
+def scan_named_records(
+    data: bytes, start: int, min_len: int = 4, max_len: int = 0x7F
+) -> list[Record]:
+    """Globally scan for length-prefixed text records (object names, comments).
+
+    Robust to the opaque embedded-asset regions that interrupt a linear walk:
+    advances one byte at a time, accepting a ``[tag][len][len printable bytes]``
+    record wherever the framing holds. May include occasional coincidental
+    matches; callers validate against an expected inventory rather than trusting
+    every hit.
+    """
+    out: list[Record] = []
+    i = start
+    n = len(data)
+    while i + 1 < n:
+        tag = data[i]
+        if TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX:
+            length = data[i + 1]
+            if min_len <= length <= max_len and i + 2 + length <= n:
+                payload = data[i + 2 : i + 2 + length]
+                if all(0x20 <= b < 0x7F for b in payload):
+                    out.append(
+                        Record(offset=i, tag=tag, length=length, payload=payload)
+                    )
+                    i += 2 + length
+                    continue
+        i += 1
+    return out
+
+
+def parse(data: bytes) -> Document:
+    """Parse an in-memory ``.opju`` buffer into a :class:`Document`."""
+    header = parse_header(data)
+    root = root_header(data, header)
+    stream_start = header.body_offset + ROOT_HEADER_LEN
+
+    header_records = list(iter_header_records(data, stream_start))
+
+    doc = Document(header=header, root_header=root, header_records=header_records)
+
+    # Record where the clean header walk stopped (first opaque region).
+    if header_records:
+        last = header_records[-1]
+        first_gap = last.offset + 2 + last.length
+    else:
+        first_gap = stream_start
+    if first_gap < len(data):
+        doc.gaps.append((first_gap, "opaque region (embedded asset / undecoded)"))
+
+    marker = data.find(PREVIEW_MARKER)
+    if marker >= 0:
+        doc.gaps.append((marker, "preview thumbnail marker (PrvwOPJU)"))
+
+    doc.names = scan_named_records(data, stream_start)
+    return doc
+
+
+def read(path: str | Path) -> Document:
+    """Read and parse an ``.opju`` file from disk."""
+    return parse(Path(path).read_bytes())

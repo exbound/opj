@@ -72,12 +72,14 @@ length-prefixed scan on this rule recovers the named objects above cleanly.
 Runs of 4–5 printable bytes without a valid preceding length byte are
 coincidental data, not strings.
 
-### 2.3 Numeric framing **[H]**
+### 2.3 Numeric framing **[E]** / **[H]**
 
-Short scalars use the same `[tag][L][payload]` framing. A recurring 2-byte
-payload is consistent with the high word of an IEEE-754 double (e.g. the bytes
-for `1.0`), suggesting a compact/truncated float encoding. **[N]** confirm the
-scalar encodings (widths, int vs float, endianness).
+Short scalars use the same `[tag][L][payload]` framing. A 2-byte payload
+`f0 3f` decodes to `1.0` as the **high 16 bits** of a little-endian IEEE-754
+double (the low 6 bytes implied zero) — a compact float encoding, **[E]**
+verified for that value. Whether a given 2-byte field is a compact float or a
+`u16` integer is position-dependent **[H]**; a tag names a value's type/width
+class, not its role (see §2.5). **[N]** the full scalar encoding table.
 
 ### 2.4 Embedded binary assets **[E]**
 
@@ -106,14 +108,35 @@ book's columns):
 83 02 <2 bytes> | 85 02 f0 3f | 83 02 f0 3f | 85 01 0a | 91 01 01 | 82 07 <name>
 ```
 
-where `0x85`/`0x83` carry scalar fields (the 2-byte `f0 3f` is the high word of
-IEEE-754 `1.0`, a compact-float encoding), `0x91` carries a 1-byte flag, and
-`0x82` carries the column name. The **first** column of a book carries its name
-under tag `0x97` rather than `0x82`. **[H]** the high nibble / specific tag id
-distinguishes a new object (`0x97`) from a continuation field (`0x82`), and the
-low bits select the field role (name / long-name / scalar / flag). **[N]** the
-full tag-id → role map, and the object-start/boundary markers needed to count
-objects against the header's `<object-count>`.
+where `0x85`/`0x83` carry scalar fields (the 2-byte `f0 3f` is the compact-float
+`1.0`), `0x91` carries a 1-byte flag, and `0x82` carries the column name. The
+**first** column of a book carries its name under a higher, object-type-dependent
+tag (`0x97` for a workbook, `0x95` for an analysis object); continuation columns
+use `0x82`. **[E]** this new-object-vs-continuation distinction, verified across
+both samples.
+
+**A tag names a value's type/width class, not its field role.** The same tag
+carries different lengths and meanings at different positions; a field's role
+comes from its position in the object type's field sequence, not from the tag.
+So the goal is **per-object field schemas**, not a global tag→role map. **[N]**
+the field schema for each object type, and the object-boundary markers needed to
+count objects against the header's `<object-count>`.
+
+### 2.6 Binary data sub-blobs **[E]** / **[N]**
+
+A worksheet column's **numeric data** is stored in a binary sub-blob after the
+name (a descriptor carrying small integers — e.g. a count — then raw values),
+**not** as `0x80–0x9F` TLV. This is the same shape as the embedded preview
+(§2.4): a self-contained binary region inside the record stream. **[N]** the
+sub-blob format (row count, data type code, value encoding) — the main open item
+for recovering actual cell data.
+
+**Reader caveat.** A forward walk that resyncs across these regions (§ the
+reference reader) reliably recovers distinctive **text** (names, comments), but
+*inside* a binary sub-blob it may report coincidental `[tag][len][payload]`
+"records" that are not real fields. Only the recovered text inventory is
+validated; records that fall inside data/asset sub-blobs are candidates, not
+decoded fields.
 
 ## 3. Compatibility oracle
 

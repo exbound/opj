@@ -178,10 +178,15 @@ def iter_records(
     """Walk the body as value records, resyncing across opaque regions.
 
     Parses ``[tag 0x80-0x9F][length][payload]`` records forward. On a byte that
-    is not a value record (an embedded-asset / undecoded region), scans forward
+    is not a value record (an embedded-asset / binary-data region), scans forward
     one byte at a time until ``run`` consecutive records parse cleanly, then
-    resumes there. This recovers the document's object/record stream despite the
-    binary asset blobs that interrupt a naive linear walk.
+    resumes there. This recovers the document skeleton and the object-name
+    inventory despite the binary blobs that interrupt a naive linear walk.
+
+    Caveat: records that fall *inside* a binary data/asset sub-blob may be
+    coincidental, not real fields. Only distinctive text (names, comments) is
+    reliable; callers validate against an expected inventory rather than trusting
+    every record. See docs/engineering-spec.md §2.6.
     """
     n = len(data)
     i = start

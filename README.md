@@ -14,18 +14,25 @@ the C1–C9 capability model and the Origin dossier.
 
 ## Status
 
-Early. The container and the document-header layer parse; the reader recovers
-the header fields and the internal object-name inventory from real published
-files. See [`docs/engineering-spec.md`](docs/engineering-spec.md) for the format
-specification and the open questions, each marked established / hypothesis /
-needs-observation.
+Early. The reader parses the container header and the document-header fields,
+and recovers the internal **object-name inventory** (worksheet/column and
+analysis-object names, with the new-object vs. continuation distinction) from
+real published files. Numeric cell data and embedded assets live in binary
+sub-blobs that are not yet decoded. See
+[`docs/engineering-spec.md`](docs/engineering-spec.md) for the specification and
+the open questions, each marked established / hypothesis / needs-observation.
 
 | Capability | Reference observed | Implemented | Verified |
 |------------|--------------------|-------------|----------|
-| C2 header + object-name inventory | yes (public samples) | yes | yes (2 samples) |
-| C2 object/record stream (resync walk) | yes | yes | partial (2 samples) |
+| C2 header fields | yes (public samples) | yes | yes (2 samples) |
+| C2 object-name inventory (resync walk) | yes | yes | yes (2 samples) |
+| C2 numeric cell data / binary sub-blobs | partial | no | no |
 | C2 embedded-asset delimiting | partial | no | no |
 | C3 document model | no | no | no |
+
+The resync walk reliably recovers distinctive text (names, comments); records it
+reports *inside* a binary data/asset sub-blob are candidates, not decoded
+fields — only the name inventory is validated.
 
 ## Install and use
 

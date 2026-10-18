@@ -86,8 +86,11 @@ class Document:
     root_header: bytes
     #: Records of the clean document-header TLV (from body+7 to the first gap).
     header_records: list[Record] = field(default_factory=list)
-    #: Length-prefixed text records recovered by a global scan (object names,
-    #: comments). Robust to the opaque regions that interrupt a linear walk.
+    #: All value records recovered from the body by the resync walk (§2), in
+    #: file order, skipping the opaque embedded-asset regions.
+    records: list[Record] = field(default_factory=list)
+    #: Length-prefixed text records (object names, comments) — the text subset
+    #: of ``records``.
     names: list[Record] = field(default_factory=list)
     #: (offset, note) for regions the reader does not yet decode.
     gaps: list[tuple[int, str]] = field(default_factory=list)
@@ -153,6 +156,76 @@ def iter_header_records(data: bytes, start: int) -> Iterator[Record]:
         i += 2 + length
 
 
+def _record_at(data: bytes, i: int, max_len: int) -> Record | None:
+    """Parse a value record at ``i``, or ``None`` if the framing does not hold."""
+    n = len(data)
+    if i + 1 >= n:
+        return None
+    tag = data[i]
+    if not (TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX):
+        return None
+    length = data[i + 1]
+    if length > max_len or i + 2 + length > n:
+        return None
+    return Record(
+        offset=i, tag=tag, length=length, payload=data[i + 2 : i + 2 + length]
+    )
+
+
+def iter_records(
+    data: bytes, start: int, run: int = 4, max_len: int = 0x60
+) -> Iterator[Record]:
+    """Walk the body as value records, resyncing across opaque regions.
+
+    Parses ``[tag 0x80-0x9F][length][payload]`` records forward. On a byte that
+    is not a value record (an embedded-asset / undecoded region), scans forward
+    one byte at a time until ``run`` consecutive records parse cleanly, then
+    resumes there. This recovers the document's object/record stream despite the
+    binary asset blobs that interrupt a naive linear walk.
+    """
+    n = len(data)
+    i = start
+    while i + 1 < n:
+        rec = _record_at(data, i, max_len)
+        if rec is not None:
+            yield rec
+            i += 2 + rec.length
+            continue
+        # opaque region: find the next point where `run` records parse cleanly
+        j = i + 1
+        while j + 1 < n:
+            p = j
+            ok = 0
+            while ok < run:
+                r = _record_at(data, p, max_len)
+                if r is None:
+                    break
+                p += 2 + r.length
+                ok += 1
+            if ok >= run:
+                break
+            j += 1
+        if j + 1 >= n:
+            return
+        i = j
+
+
+def _find_gaps(data: bytes, records: list[Record], start: int) -> list[tuple[int, str]]:
+    """Report the opaque spans between recovered records, plus the preview."""
+    gaps: list[tuple[int, str]] = []
+    cursor = start
+    for r in records:
+        if r.offset > cursor:
+            gaps.append((cursor, f"opaque region ({r.offset - cursor} bytes)"))
+        cursor = r.offset + 2 + r.length
+    if cursor < len(data):
+        gaps.append((cursor, f"trailing region ({len(data) - cursor} bytes)"))
+    marker = data.find(PREVIEW_MARKER)
+    if marker >= 0:
+        gaps.append((marker, "preview thumbnail (PrvwOPJU): serialized bitmap"))
+    return gaps
+
+
 def scan_named_records(
     data: bytes, start: int, min_len: int = 4, max_len: int = 0x7F
 ) -> list[Record]:
@@ -190,23 +263,16 @@ def parse(data: bytes) -> Document:
     stream_start = header.body_offset + ROOT_HEADER_LEN
 
     header_records = list(iter_header_records(data, stream_start))
+    records = list(iter_records(data, stream_start))
 
-    doc = Document(header=header, root_header=root, header_records=header_records)
-
-    # Record where the clean header walk stopped (first opaque region).
-    if header_records:
-        last = header_records[-1]
-        first_gap = last.offset + 2 + last.length
-    else:
-        first_gap = stream_start
-    if first_gap < len(data):
-        doc.gaps.append((first_gap, "opaque region (embedded asset / undecoded)"))
-
-    marker = data.find(PREVIEW_MARKER)
-    if marker >= 0:
-        doc.gaps.append((marker, "preview thumbnail marker (PrvwOPJU)"))
-
-    doc.names = scan_named_records(data, stream_start)
+    doc = Document(
+        header=header,
+        root_header=root,
+        header_records=header_records,
+        records=records,
+    )
+    doc.names = [r for r in records if r.is_text and r.length >= 4]
+    doc.gaps = _find_gaps(data, records, stream_start)
     return doc
 
 

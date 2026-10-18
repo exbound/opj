@@ -22,8 +22,9 @@ needs-observation.
 
 | Capability | Reference observed | Implemented | Verified |
 |------------|--------------------|-------------|----------|
-| C2 header + object-name inventory | yes (public samples) | yes | yes (against 2 samples) |
-| C2 full document structure | partial | no | no |
+| C2 header + object-name inventory | yes (public samples) | yes | yes (2 samples) |
+| C2 object/record stream (resync walk) | yes | yes | partial (2 samples) |
+| C2 embedded-asset delimiting | partial | no | no |
 | C3 document model | no | no | no |
 
 ## Install and use

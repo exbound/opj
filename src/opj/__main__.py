@@ -27,10 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     for r in doc.header_records:
         shown = r.text if r.text is not None else r.payload.hex(" ")
         print(f"  @{r.offset:#08x} tag={r.tag:02x} len={r.length:<3d} {shown}")
-    names = doc.name_strings
-    print(f"recovered names ({len(names)}):")
-    for s in names:
-        print(f"  {s}")
+    print(f"records         {len(doc.records)} (resync walk)")
+    print(f"recovered names ({len(doc.names)}):")
+    for r in doc.names:
+        print(f"  @{r.offset:#08x} tag={r.tag:02x} {r.text}")
     if doc.gaps:
         print("undecoded regions:")
         for off, note in doc.gaps:

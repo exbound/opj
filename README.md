@@ -34,6 +34,9 @@ The resync walk reliably recovers distinctive text (names, comments); records it
 reports *inside* a binary data/asset sub-blob are candidates, not decoded
 fields — only the name inventory is validated.
 
+Recovering actual cell data is a multi-phase campaign (the format is a hybrid of
+fixed-layout binary records and TLV); see [`ROADMAP.md`](ROADMAP.md).
+
 ## Install and use
 
 Requires Python 3.11+. From a checkout:

@@ -138,6 +138,23 @@ reference reader) reliably recovers distinctive **text** (names, comments), but
 validated; records that fall inside data/asset sub-blobs are candidates, not
 decoded fields.
 
+### 2.7 Record model: fixed structs + TLV **[E]** / **[N]**
+
+The on-disk records are **not uniform**. Analysis shows two coexisting forms:
+
+- **Fixed-layout binary records** — a packed struct of scalar fields at fixed
+  byte offsets, read as a block and unpacked into the object. The document and
+  global/header records use this form (a family of ~32 record types).
+- **Length-prefixed TLV records** — the `0x80–0x9F` `[tag][len][val]` form of
+  §2.1–2.6, used for object names, comments, and variable data.
+
+So the format is a **hybrid**: a record may carry a fixed-struct part and a
+variable TLV tail. **[E]** both forms are present (the TLV-name result of §2.2 is
+verified; the fixed-struct form is established from the loader's per-type
+unpacking). **[N]** the record-type catalog, the exact boundary between the
+fixed part and the TLV tail of a record, and where bulk worksheet/matrix **cell
+data** sits — this is the object-model decode tracked in `ROADMAP.md`.
+
 ## 3. Compatibility oracle
 
 - **Fixtures:** publicly published OriginLab `.opju` files (see
@@ -148,11 +165,15 @@ decoded fields.
 
 ## 4. Open questions (prioritized)
 
-1. **[N]** Tag-id → field-role map (which tag ids are object name, long name,
-   comment, units, dimensions, …).
-2. **[N]** Object nesting and boundaries — where one document object ends and
-   the next begins.
-3. **[N]** Embedded-asset length/offset encoding.
-4. **[N]** Scalar numeric encodings (§2.3).
-5. **[N]** Legacy `.opj` delta (how much the existing open `.opj` readers already
-   cover vs. `.opju`).
+The object-model decode (records → object tree → cell data) is a campaign; see
+[`ROADMAP.md`](../ROADMAP.md) for the phased plan.
+
+1. **[N]** Record-type catalog and the fixed-struct vs TLV-tail boundary (§2.7).
+2. **[N]** Per-object field schemas: which position carries name, long name,
+   comment, units, dimensions, etc. (roles are positional, not per-tag — §2.5).
+3. **[N]** Object nesting and boundaries — the document tree and object count.
+4. **[N]** Bulk cell-data encoding (worksheet columns and matrices) — the data
+   is not a plain contiguous array and lives in a per-object mechanism.
+5. **[N]** Embedded-asset length/offset encoding (preview bitmap, images).
+6. **[N]** Scalar numeric encodings (§2.3).
+7. **[N]** Legacy `.opj` delta vs. what existing open `.opj` readers cover.

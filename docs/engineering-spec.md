@@ -84,7 +84,9 @@ scalar encodings (widths, int vs float, endianness).
 The document embeds binary blobs within the stream:
 
 - A **preview thumbnail**, introduced by the ASCII section marker `PrvwOPJU`
-  ("Preview OPJU").
+  ("Preview OPJU"). The preview is a serialized **bitmap** with its own size
+  field. **[N]** its exact length encoding (the key blocker for a linear walk
+  past it).
 - **Image data**: real files contain PNG, BMP, and EMF payloads (verified by
   signature — e.g. a sample contains 21 PNG blocks).
 
@@ -92,6 +94,26 @@ These assets are **not** part of the `0x80–0x9F` length-prefixed TLV; the
 high-byte regions (`0xC0`–`0xFF`) that a naive 1-byte-length parse chokes on are
 these embedded payloads. **[N]** the exact length/offset encoding that delimits
 each asset — the reader discovers and records this against the samples.
+
+### 2.5 Object and column records **[E]**
+
+A document object is an ordered run of `[tag][len][val]` field records. A
+worksheet column, for example, appears as a fixed field group immediately before
+its name record. Observed consistently in a real sample (identical across a
+book's columns):
+
+```
+83 02 <2 bytes> | 85 02 f0 3f | 83 02 f0 3f | 85 01 0a | 91 01 01 | 82 07 <name>
+```
+
+where `0x85`/`0x83` carry scalar fields (the 2-byte `f0 3f` is the high word of
+IEEE-754 `1.0`, a compact-float encoding), `0x91` carries a 1-byte flag, and
+`0x82` carries the column name. The **first** column of a book carries its name
+under tag `0x97` rather than `0x82`. **[H]** the high nibble / specific tag id
+distinguishes a new object (`0x97`) from a continuation field (`0x82`), and the
+low bits select the field role (name / long-name / scalar / flag). **[N]** the
+full tag-id → role map, and the object-start/boundary markers needed to count
+objects against the header's `<object-count>`.
 
 ## 3. Compatibility oracle
 

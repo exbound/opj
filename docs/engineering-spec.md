@@ -66,49 +66,58 @@ other global-header fields.
 
 ## 2. Record stream
 
-From body+7 the body is a **tag / length / value byte stream**, consumed by a
-forward byte cursor. The reader repeatedly reads one tag byte and dispatches on
-its value.
+### 2.1 Run-length layer **[E]** / **[H]**
 
-### 2.1 Length-prefixed value records, tags `0x80`–`0x9F` **[E]**
+From body+7 the stream is **run-length coded**. A reader expands tokens into a
+logical byte stream, and the fixed-layout structures are in that logical stream:
 
-```
-[tag: 1 byte, 0x80–0x9F] [length: 1 byte L] [payload: L bytes]
-```
+| Token byte `t` | Meaning |
+|---|---|
+| `0x00`–`0x7F` | `t` literal bytes follow |
+| `0x80`–`0xBF` | `(t & 0x3F) + 3` zero bytes |
+| `0xC0`–`0xFF` | `(t & 0x3F) + 3` copies of the next byte |
 
-The payload is either text (UTF-8/ASCII) for name and comment fields, or a
-short little-endian numeric for scalar fields. **[H]** the low 5 bits of the tag
-encode a field/role id; the high bits mark the value class. This model has been
-verified to recover, from the real samples, document comment strings and the
-internal object-name inventory (worksheet names such as `Book1_A` … `Book1_I`,
-`Book2_A`; analysis-object names such as `PrRhSn3_A` … `PrRhSn3_E`).
+So what looks like a tag, length and value is usually a zero run followed by a
+literal run. `85 02 f0 3f` is 8 zero bytes and then `f0 3f`, not a typed field.
 
-### 2.2 String framing **[E]**
+**[E]** for column records (§2.5, 903 of 903) and the settings document (§2.8, 98
+of 98). **[H]** for the rest of the stream, which is not yet walked end to end.
+Column payloads (§2.6), string sections (§2.7) and listed PNGs (§2.4) sit in the
+file uncoded.
 
-A text record is `[tag][L][L bytes]` with `L` the exact byte count. Verified: a
-length-prefixed scan on this rule recovers the named objects above cleanly.
-Runs of 4–5 printable bytes without a valid preceding length byte are
-coincidental data, not strings.
+Evidence for the zero-run base, over 903 column records:
 
-### 2.3 Numeric framing **[E]** / **[H]**
+| Base | Expanded record sizes |
+|---|---|
+| 3 | 147 bytes in 900, 130 in 3 (those 3 are mis-framed, see §2.5) |
+| 2 | at least 6 sizes, largest share 136 in 362 |
+| 1 | at least 6 sizes, largest share 125 in 362 |
+| 0 | at least 6 sizes, largest share 114 in 362 |
 
-Short scalars use the same `[tag][L][payload]` framing. A 2-byte payload
-`f0 3f` decodes to `1.0` as the **high 16 bits** of a little-endian IEEE-754
-double (the low 6 bytes implied zero) — a compact float encoding, **[E]**
-verified for that value. Whether a given 2-byte field is a compact float or a
-`u16` integer is position-dependent **[H]**; a tag names a value's type/width
-class, not its role (see §2.5). **[N]** the full scalar encoding table.
+These sizes come from taking the frame nearest the descriptor.
+
+For the byte-run base, `://www.` is rebuilt in 3 of 3 URLs at base 3 and in 0 of 3
+at base 2 or base 4. That is a small sample.
+
+### 2.2 Text **[E]**
+
+Names and comments are literal runs, so a scan for a plausible token and length
+recovers them without expanding the stream: names such as `Book1_A`, and comments.
+A literal run can hold more than the text, and long text continues across runs of
+at most 127 bytes.
+
+### 2.3 Numeric fields **[E]**
+
+There is no compact float encoding in this layer. A double such as `1.0` shows as
+`f0 3f` because its low six bytes are zero and fall inside a zero run. **[N]** the
+fields of each structure (§2.5).
 
 ### 2.4 Embedded binary assets **[E]**
 
-The document embeds binary blobs within the stream:
+The document embeds binary blobs:
 
 - **Image data**: real files contain PNG, BMP, and EMF payloads (verified by
   signature — e.g. a sample contains 21 PNG blocks).
-
-These assets are **not** part of the `0x80–0x9F` length-prefixed TLV. The
-high-byte regions (`0xC0`–`0xFF`) that a naive 1-byte-length parse chokes on
-include these payloads.
 
 **Asset directory [E] / [N].** The `u64` after `PrvwOPJU` (§1.3) is the absolute
 file offset of a directory:
@@ -126,71 +135,75 @@ u64 count | u32 0 | u32 table-bytes | count entries of table-bytes/count bytes
 A directory need not list every image: across those 51 files, 131 of 135 PNG
 signatures sit at an entry start.
 
-### 2.5 Object and column records **[E]**
+### 2.5 Column records **[E]** / **[N]**
 
-A document object is an ordered run of `[tag][len][val]` field records. A
-worksheet column, for example, appears as a fixed field group immediately before
-its name record. Observed consistently in a real sample (identical across a
-book's columns):
+A column is a coded record, then a descriptor and an uncoded payload (§2.6):
 
 ```
-83 02 <2 bytes> | 85 02 f0 3f | 83 02 f0 3f | 85 01 0a | 91 01 01 | 82 07 <name>
+80 <n> | <n coded bytes> | 18 | u64 24 | u64 L | 8 bytes | 0A | L bytes of payload
 ```
 
-where `0x85`/`0x83` carry scalar fields (the 2-byte `f0 3f` is the compact-float
-`1.0`), `0x91` carries a 1-byte flag, and `0x82` carries the column name. The
-**first** column of a book carries its name under a higher, object-type-dependent
-tag (`0x97` for a workbook, `0x95` for an analysis object); continuation columns
-use `0x82`. **[E]** this new-object-vs-continuation distinction, verified across
-both samples.
+The `n` coded bytes end in a zero-run token. Expanded through §2.1, the record is
+147 bytes with the column name, NUL-padded, at offset `0x58`, in 903 of 903. `80
+<n>` can also occur by coincidence inside the coded bytes, so more than one frame
+can end at a descriptor (6 of 903): take the nearest one that expands to 147 bytes.
+`0x58` is also where the open `liborigin` reader documents the name in the legacy
+`.opj` dataset header, so **[H]** the legacy header layout largely carries over.
+**[N]** the other fields.
 
-**A tag names a value's type/width class, not its field role.** The same tag
-carries different lengths and meanings at different positions; a field's role
-comes from its position in the object type's field sequence, not from the tag.
-So the goal is **per-object field schemas**, not a global tag→role map. **[N]**
-the field schema for each object type, and the object-boundary markers.
-
-### 2.6 Column data payloads **[E]** / **[N]**
-
-A column's data is not TLV. It follows the column's name record as a descriptor
-and a payload:
-
-```
-[tag 0x80–0x9F] 18 | u64 24 | u64 L | 8 bytes | 0A | L bytes of payload
-```
+An earlier version of this document read a "new-object" tag such as `0x97` against
+a "continuation" tag `0x82`. Those are zero-run lengths before the name, so they
+reflect how many preceding bytes happen to be zero. **[H]** They do not mark
+objects.
 
 **[N]** the 8 descriptor bytes. Searching for the descriptor's first 10 bytes
-also finds coincidental matches, so `L` must be validated: of 1039 candidates in
-the corpus, 903 have payloads ending in the two bytes `CE FA`.
+(`[tag] 18 18 00 00 00 00 00 00 00`) also finds coincidental matches, so `L` must
+be validated: of 1039 candidates, 903 have payloads ending in the two bytes
+`CE FA`.
 
-**Payload.** 855 of those begin with `05`, in this form:
+### 2.6 Column payloads **[E]** / **[H]**
+
+All 903 payloads parse to their exact end with the row count equal to `a`:
 
 ```
-05 <LEB128 a> FF FF <LEB128 b> <1 byte> <token stream> CE FA
+payload := kind leb(a) segment* CE FA                 kind: 05 (855) or 04 (48)
+segment := FF FF leb(n) flag token*                   n rows
+         | u16 selector value                         1 row, flag = selector (0 or 1)
+token   := leb(v)
+           odd:  (v >> 1) + 1 literal values
+           even: v >> 1 copies of one value
 ```
 
-`b` counts the values the stream holds. `a` is the row count including trailing
-empty rows (`a == b` in 379 of 816, `a > b` in 437, and never less; see trailers
-below). **[N]** the single byte (`00` in 786 of 816, and in all 705 decoded FPC
-blocks), the `04` payload form (48), and `05` payloads lacking `FF FF` (39).
+`leb` is LEB128. A segment of the `FF FF` form (1323) holds exactly `n` rows of
+tokens; single-value segments appear 110 times with selector 0 and 48 with 1. As a
+control, literal counts of `v >> 1` or `(v >> 1) + 2` each pass only 61 of 903.
 
-**Token stream.** Each token starts with a LEB128 varint `v`:
+The value type follows the flag and kind:
 
-- **Odd `v` — FPC block [E]** (below). `(v >> 1) + 1 == b` in 705 of 795 such
-  streams. **[N]** the other 90, where the block appears to hold fewer than `b`
-  values and further tokens follow.
-- **Even `v` — run [E] / [N]**: `v >> 1` copies of one following fixed-width
-  value. Streams made only of runs sum to exactly `b` in 14 of 21 even-first
-  streams, 12 of those being a single run of 1-byte values, which is weak
-  evidence. **[N]** where the value's width and type are stated, and the other 7.
+| Flag | Kind | Single or run value | Literal values | Rows |
+|---|---|---|---|---|
+| 1 | `05` | string: `leb(len)` + bytes; `00` is empty | same, one after another | 18414 |
+| 1 | `04` | integer: `leb`, an offset into a string section (§2.7), 0 for none | same, one after another | 4602 |
+| any other | either | compact double | FPC block | 357062 doubles, 1892 special |
 
-**FPC block [E].** The values are little-endian doubles compressed with FPC:
-M. Burtscher and P. Ratanaworabhan, "FPC: A High-Speed Compressor for
-Double-Precision Floating-Point Data," *IEEE Trans. Computers* 58(1), 2009. The
-predictors and hashes are as published. Laid out here as:
+Flag `0` is the usual double case (790 `FF FF` segments of kind `05`, 1 of kind
+`04`). **[H]** Flag `3`, seen once with values near 2.4 million, marks dates. The
+flag's full meaning is read from behaviour, not established.
 
-- The byte after `v` is the table size in bits (`0C`, 12 bits, in all 705): both
-  tables hold 2^12 entries, zero-initialized.
+**Compact double [E] / [H].** Code byte `c`, then `w = (c - 8) / 9` bytes, which are
+the high bytes of a little-endian double whose low bytes are zero: `11 40` is 2.0,
+`1a f0 3f` is 1.0, `23 20 9f 40` is 1992.0. Seen for `w` of 1, 2, 3, 4, 7 and 8.
+Codes `64` (1366 rows) and `65` (526 rows) have no following bytes. **[H]** They
+stand for 0.0 and the missing value. A reader should report them as special until
+this is established.
+
+**FPC block [E].** Literal doubles are compressed with FPC: M. Burtscher and P.
+Ratanaworabhan, "FPC: A High-Speed Compressor for Double-Precision Floating-Point
+Data," *IEEE Trans. Computers* 58(1), 2009. The predictors and hashes are as
+published. Laid out here as:
+
+- The first byte is the table size in bits (`0C`, 12 bits, in every block): both
+  tables hold 2^12 entries, zero-initialized for each block.
 - Codes and residuals are **interleaved**: one byte holds two 4-bit codes, low
   nibble first, and is followed directly by those two values' residuals. This
   differs from the block layout in the paper.
@@ -199,11 +212,11 @@ predictors and hashes are as published. Laid out here as:
   length 4. A residual is little-endian with its high zero bytes omitted.
 - value = prediction XOR residual, on the 64-bit pattern.
 - For an odd count, the last code byte's high nibble is unused and has no
-  residual, unlike the paper's spurious value: 118 of the 294 exactly consumed
-  blocks have odd counts.
+  residual, unlike the paper's spurious value.
 
-Evidence over the 705 blocks and 265177 values, as the share of decoded values
-with a short decimal form (at most 9 significant digits):
+Evidence over the 705 payloads whose first token is a block of all `b` values, and
+their 265177 values, as the share of decoded values with a short decimal form (at
+most 9 significant digits):
 
 | Parameters | Share |
 |---|---|
@@ -213,45 +226,58 @@ with a short decimal form (at most 9 significant digits):
 | FCM hash left-shift 5 instead of 6 | 0.108 |
 | opposite predictor bit | 0.023 |
 
-All 705 blocks decode without overrun: 294 consume the stream exactly and 411
-leave trailing bytes. Absence of overrun does not test these parameters, because
-residual lengths come from the codes alone; every variant above also has none.
+Absence of overrun does not test these parameters, because residual lengths come
+from the codes alone.
 
-**Trailers [E] / [N].** After a block, `FF FF <LEB128 n> 01 <LEB128 2n> 00` states
-`n` trailing empty rows, with `n + b == a`: 391 of the 411 trailers (384 of 6
-bytes, 7 of 8 bytes). **[N]** the other 20.
-
-*Values are not yet verified against the reference application.* A public-fact
-check: a periodic-table sample's first column equals the IUPAC group of elements
-Z = 1–54, 54 of 54.
+*Values are not yet verified against the reference application.* Public-fact
+checks: a periodic-table sample's first column equals the IUPAC group of elements
+Z = 1–54, 54 of 54, and its second is 1, 1, then runs of the period lengths.
 
 **Do not derive an implementation from the authors' FPC source code.** It is
 under a non-commercial license. Implement from this document and the paper.
 
-**Reader caveat.** A forward walk that resyncs across these regions (§ the
-reference reader) reliably recovers distinctive **text** (names, comments), but
-*inside* a payload it may report coincidental `[tag][len][payload]` "records"
-that are not real fields. Records that fall inside data/asset regions are
-candidates, not decoded fields.
+### 2.7 String sections **[E]** / **[H]**
 
-### 2.7 Record model: fixed blocks + TLV **[E]** / **[N]**
+Integer columns refer to strings stored in LZ4-compressed sections, 48 in the
+corpus:
 
-The on-disk records are **not uniform**:
+```
+#_MSER_STRINGS_PSET 05 01 leb(csize) 00 u32(usize) | LZ4 block
+```
 
-- **Fixed-layout blocks** — the sized global header (§1.3).
-- **Length-prefixed TLV records** — the `0x80–0x9F` `[tag][len][val]` form of
-  §2.1–2.5, used for object names, comments, and short values.
+The LZ4 block starts right after `usize`, and decodes to exactly `usize` bytes in
+48 of 48. `csize` is the block's length plus 4, for `usize`, in 48 of 48.
+Decoded content:
 
-**[H]** Other records also carry a fixed-layout part. **[N]** a record-type
-catalog, and the full object nesting that places each column in its sheet.
+```
+77 11 11 11 | u16 2 | u16 1 | u32 4 | u32 count | u32 bytes | u32 rows | strings
+```
 
-### 2.8 Long text **[E]**
+The strings are NUL-separated. A column's integer minus 1 is the offset of that
+row's string. All 48 integer columns land only on string starts (46 with `FF FF`
+segments, 2 with only single-value segments), giving text such as `Albania`,
+`Austria`. **[H]** A column uses the first section after its payload: that rule
+gave these results, but it is not independently established. **[N]** the header
+fields here named `count`, `bytes` and `rows`. The names are placeholders: `count`
+equals the number of strings in only 4 of 48 sections, and `bytes` equals the
+string bytes in 0 of 48.
 
-Text longer than one length byte can state is cut into chunks: a tag, then
-repeated `7F` + 127 bytes. Removing the `7F` bytes repairs words split across
-chunks. XML with an `<OriginStorage>` root is stored this way, and holds stored
-analysis operations and their input ranges. **[N]** how a chain ends, and the
-schema of this XML.
+### 2.8 Settings document **[E]** / **[N]**
+
+Each of the 98 files has a UTF-8 XML document with an `<OriginStorage>` root,
+reached by a zero-run token and a literal run, and well-formed once the run-length
+layer is expanded up to its terminating NUL. Its direct children are named after
+tools, 225 distinct names over the corpus. Some files hold further documents of
+this kind later on. **[N]** how many, and their role.
+
+**This is not established to be a record of operations on the project's data, and
+the evidence is against it.** Fitting tools appear in bar-chart templates with no
+fit, and input ranges name sheets not seen in the project. **[H]** It holds saved
+per-tool settings carried with the file. Numeric fit fields exist in it; **[N]**
+whether they describe the project's data, and where a real operation tree lives.
+
+Values in this document can hold local file paths and usernames from other
+machines. Do not copy them into tests, fixtures or documentation.
 
 ## 3. Compatibility oracle
 
@@ -274,15 +300,12 @@ schema of this XML.
 
 See [`ROADMAP.md`](../ROADMAP.md) for the phased plan.
 
-1. **[N]** Column value types: run values, `04` payloads, and `05` payloads
-   lacking `FF FF` (§2.6), plus FPC blocks followed by further tokens.
-2. **[N]** The 20 trailers that do not state empty rows (§2.6).
-3. **[N]** Matrix storage: whether matrices share the column payload form.
-4. **[N]** Stored-analysis XML: chain end and schema (§2.8).
-5. **[N]** Record-type catalog (§2.7).
-6. **[N]** Per-object field schemas: which position carries name, long name,
-   comment, units, dimensions, etc. (roles are positional, not per-tag — §2.5).
+1. **[N]** The meaning of compact-double codes `64` and `65` (§2.6).
+2. **[N]** The flag byte's full meaning, including flag `3` (§2.6).
+3. **[N]** The fields of the expanded column record, against the legacy header (§2.5).
+4. **[N]** A walk of the whole run-length stream, and a record-type catalog (§2.1).
+5. **[N]** Matrix storage: whether matrices share the column payload form.
+6. **[N]** Where a real operation tree lives, if anywhere (§2.8).
 7. **[N]** Object nesting and boundaries — the document tree.
 8. **[N]** 36-byte asset-directory entries (§2.4).
-9. **[N]** Scalar numeric encodings (§2.3).
-10. **[N]** Legacy `.opj` delta vs. what existing open `.opj` readers cover.
+9. **[N]** Legacy `.opj` delta vs. what existing open `.opj` readers cover.

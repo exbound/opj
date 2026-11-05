@@ -38,3 +38,11 @@ OPJ_FIXTURES=/path/to/samples just test
 
 or drop the files in `tests/fixtures/_local/`. Without fixtures present, the
 sample-dependent tests skip and the synthetic tests still run.
+
+`tests/test_corpus.py` reproduces the specification's corpus figures. It skips
+unless `OPJ_CORPUS` names a flat directory holding the 98 files listed in
+`docs/engineering-spec.md` §3:
+
+```sh
+OPJ_CORPUS=/path/to/corpus just test
+```

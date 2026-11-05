@@ -43,13 +43,18 @@ def test_parse_header_fields() -> None:
     assert isinstance(h, Header)
     assert h.magic == "CPYUA"
     assert h.format_version == "1.0"
-    assert h.object_count == 3
+    assert h.build == 3
     assert h.body_offset == len(b"CPYUA 1.0 3\n")
 
 
 def test_parse_header_rejects_non_origin() -> None:
     with pytest.raises(OpjError):
         parse_header(b"not an origin file\n")
+
+
+def test_parse_header_rejects_non_integer_build() -> None:
+    with pytest.raises(OpjError, match="build"):
+        parse_header(b"CPYUA 1.0 x\n")
 
 
 def test_parse_header_rejects_truncated() -> None:
@@ -132,7 +137,7 @@ def test_gap_between_records_is_reported() -> None:
 def test_sampledata_inventory(sample_data: Path) -> None:
     doc = read(sample_data)
     assert doc.header.magic == "CPYUA"
-    assert doc.header.object_count > 0
+    assert doc.header.build > 0
     assert doc.root_header[2:6] == ROOT_HEADER_CONST
     names = set(doc.name_strings)
     assert {"Book1_A", "Book1_B", "Book1_C"} <= names

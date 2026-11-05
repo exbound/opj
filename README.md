@@ -14,15 +14,16 @@ the C1–C9 capability model and the Origin dossier.
 
 ## Status
 
-Early. The reader parses the container header, the document-header fields, and
-the global header's version and build; recovers the internal **object-name
-inventory** (worksheet/column and analysis-object names, with the new-object vs.
-continuation distinction); delimits assets through the 16-byte asset directory;
-and decodes column payloads that hold one FPC block of `b` values. Other column
-and directory forms are reported as undecoded, with the reason, rather than
-guessed. See [`docs/engineering-spec.md`](docs/engineering-spec.md) for the
-specification and the open questions, each marked established / hypothesis /
-needs-observation.
+Early. The reader parses the container header and the global header's version
+and build; expands the run-length layer; reads column records for their names;
+decodes column payloads to all their rows (doubles, strings, and integers resolved
+through LZ4-compressed string sections); delimits assets through the 16-byte asset
+directory; and exposes the stored settings document as raw bytes. Compact-double
+codes whose meaning is not established stay as distinct markers, and an
+integer that cannot be resolved stays an integer, with the failure recorded. The
+stream is not walked end to end. See
+[`docs/engineering-spec.md`](docs/engineering-spec.md) for the specification and
+the open questions, each marked established / hypothesis / needs-observation.
 
 **Nothing here has been verified against the reference application.** "Observed"
 means seen in the bytes of the 98 public files in the specification's corpus;
@@ -34,22 +35,26 @@ checks, as noted.
 | Capability | Reference observed | Implemented | Verified against reference | Backed by |
 |------------|--------------------|-------------|----------------------------|-----------|
 | C2 header fields, global-header version and build | yes (98 files) | yes | no | corpus figures |
-| C2 object-name inventory (resync walk) | yes (2 samples) | yes | no | sample inventory tests |
+| C2 text inventory (literal-run scan) | yes (2 samples) | yes | no | sample inventory tests |
+| C2 run-length layer | partial (column records, settings document) | yes | no | corpus figures |
+| C2 column names (expanded record) | yes (903 records) | yes | no | corpus figures |
+| C2 column values: doubles, strings, integers | yes (903 payloads) | yes | no | corpus figures, public-fact checks |
+| C2 compact-double codes `64`, `65` | yes (1892 rows) | no: kept as markers | no | |
+| C2 integer resolution through string sections | yes (48 sections) | yes, by a hypothesized rule | no | corpus figures, public-fact check |
+| C2 settings document | yes (98 files) | raw bytes only | no | corpus figures |
 | C2 asset directory, 16-byte entries | yes (51 files) | yes | no | corpus figures |
 | C2 asset directory, other shapes | yes (47 files) | no: reported unsupported | no | |
-| C2 column values, single FPC block | yes (705 payloads) | yes | no | corpus figures, public-fact checks |
-| C2 column values, other forms | partial (198 payloads) | no: reported undecoded | no | |
-| C2 column names | partial | best-effort | no | sample tests |
 | C2 embedded-asset contents | partial (signatures) | no | no | |
+| C2 whole-stream walk, record catalog | no | no | no | |
 | C2 matrices | no | no | no | |
 | C3 document model | no | no | no | |
 
-The resync walk reliably recovers distinctive text (names, comments); records it
-reports *inside* a binary data/asset sub-blob are candidates, not decoded
-fields.
+The text scan recovers names and comments from literal runs without expanding the
+stream. Its hits are candidates: they include coincidental matches and pieces of
+stored XML.
 
-Recovering all cell data is a multi-phase campaign (the format is a hybrid of
-fixed-layout binary records and TLV); see [`ROADMAP.md`](ROADMAP.md).
+The settings document's values can hold local paths and usernames from other
+machines, so the CLI prints only its size and its number of direct children.
 
 ## Install and use
 
@@ -61,9 +66,9 @@ python -m opj path/to/project.opju
 ```
 
 The CLI prints the header fields, the build and version, an asset-directory
-summary, the root header, the recovered object-name inventory, and each column's
-name, row count and first few values. It flags the undecoded column forms and
-the opaque regions it does not yet decode.
+summary, the root header, the settings document's size and number of direct
+children, counts of string sections and text candidates, and each column's name,
+row count and first few values, with any parse or resolution problem.
 
 ## Build and test
 

@@ -1,11 +1,11 @@
 """Reader for Origin ``.opju`` project files.
 
-Implements the format described in ``docs/engineering-spec.md``. The body is a
-tag/length/value byte stream read by a forward cursor; text and short scalar
-records use ``[tag 0x80-0x9F][length byte][payload]`` framing, interleaved with
-opaque regions that this reader records as gaps. The global header, the
-16-byte asset directory, and FPC-compressed column data are decoded; forms the
-specification does not establish are reported as undecoded, never guessed.
+Implements the format described in ``docs/engineering-spec.md``. From body+7 the
+stream is run-length coded (:func:`expand`). Column records and the settings
+document are read through that layer; what looks like a tag, a length and a value
+in the raw bytes is usually a zero run followed by a literal run. Column payloads
+and string sections sit in the file uncoded. The rest of the stream is not walked
+end to end: this reader finds its structures by their framing.
 
 Everything here is derived from the functional specification and the observable
 bytes of publicly published sample files.
@@ -13,16 +13,18 @@ bytes of publicly published sample files.
 
 from __future__ import annotations
 
+import bisect
 import math
 import re
 import struct
+import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any
 
-from . import fpc
+from . import fpc, lz4
 
 # --- format constants (see docs/engineering-spec.md) -----------------------
 
@@ -33,25 +35,48 @@ MAGIC_OPJU = b"CPYUA"
 ROOT_HEADER_LEN = 7
 #: Bytes [2:6] of the root header are constant across documents.
 ROOT_HEADER_CONST = bytes((0x6C, 0xC0, 0x11, 0x01))
-#: Inclusive tag range for length-prefixed value records (text / short scalar).
-TAG_VALUE_MIN = 0x80
-TAG_VALUE_MAX = 0x9F
+#: Run-length tokens: below 0x80 literal, below 0xC0 zero run, else byte run.
+ZERO_RUN_MIN = 0x80
+BYTE_RUN_MIN = 0xC0
+RUN_LENGTH_MASK = 0x3F
+ZERO_RUN_BASE = 3
+BYTE_RUN_BASE = 3
 #: ASCII marker that ends the opening records; the asset-directory offset follows.
 PREVIEW_MARKER = b"PrvwOPJU"
 #: Offset of the version value within the global header.
 GLOBAL_HEADER_VERSION_OFFSET = 0x1B
-#: Start of a column descriptor: any value tag, length 24, then u64 24.
+#: Start of a column descriptor, with the record's last token before it.
 COLUMN_DESCRIPTOR = re.compile(rb"[\x80-\x9f]\x18\x18\x00{7}")
-#: Bytes from the start of a column descriptor to its payload.
-COLUMN_DESCRIPTOR_LEN = 27
+#: Bytes from the descriptor's ``18`` to its payload.
+COLUMN_DESCRIPTOR_LEN = 26
+#: The first byte of a column record's frame; its length byte follows.
+COLUMN_RECORD_FRAME = 0x80
+#: A column record's expanded size, and where its NUL-padded name sits.
+COLUMN_RECORD_SIZE = 147
+COLUMN_NAME_OFFSET = 0x58
 #: The last two bytes of a column payload.
 COLUMN_PAYLOAD_END = b"\xce\xfa"
+#: Payload kinds.
+KIND_STRING = 0x05
+KIND_INTEGER = 0x04
+#: The flag that makes a segment's values strings or integers, by kind.
+FLAG_NON_DOUBLE = 1
 #: FPC table size in bits, the only value established for column blocks.
 COLUMN_FPC_TABLE_BITS = 12
+#: A string section's framing, then its decoded header and header size.
+STRING_SECTION = re.compile(rb"#_MSER_STRINGS_PSET\x05\x01")
+STRING_HEADER_MAGIC = b"\x77\x11\x11\x11"
+STRING_HEADER = struct.Struct("<4sHHIIII")
+#: The settings document's root, reached by a zero run and a literal run.
+SETTINGS_ROOT = b"<OriginStorage>"
 
 
 class OpjError(Exception):
     """Raised when a buffer is not a recognizable Origin project file."""
+
+
+class RunLengthError(OpjError):
+    """Raised when a run-length token's operands run past the input."""
 
 
 @dataclass(frozen=True)
@@ -66,7 +91,7 @@ class Header:
 
 @dataclass(frozen=True)
 class Record:
-    """One length-prefixed value record from the tag/length/value stream."""
+    """A literal run found by scanning, with the token byte before its count."""
 
     offset: int
     tag: int
@@ -84,15 +109,6 @@ class Record:
         if not self.is_text:
             return None
         return self.payload.decode("latin-1")
-
-    def as_u16(self) -> int | None:
-        return struct.unpack("<H", self.payload)[0] if self.length == 2 else None
-
-    def as_u32(self) -> int | None:
-        return struct.unpack("<I", self.payload)[0] if self.length == 4 else None
-
-    def as_f64(self) -> float | None:
-        return struct.unpack("<d", self.payload)[0] if self.length == 8 else None
 
 
 @dataclass(frozen=True)
@@ -127,35 +143,92 @@ class AssetDirectory:
     unsupported: str | None = None
 
 
-class Undecoded(StrEnum):
-    """Why a column's values were not decoded."""
+@dataclass(frozen=True)
+class Special:
+    """A compact-double code with no value bytes, whose meaning is not established.
 
-    PAYLOAD_04 = "04 payload form is not established"
-    PAYLOAD_UNKNOWN = "payload form is neither 05 nor 04"
-    NO_MARKER = "05 payload lacks FF FF"
-    MALFORMED_HEAD = "payload head or token stream is truncated"
-    RUN_TOKEN = "stream starts with a run, whose value width is not established"
-    COUNT_MISMATCH = "FPC block holds a different number of values than b"
+    It is deliberately not a number: compare ``code`` with :data:`SPECIAL_64` and
+    :data:`SPECIAL_65`.
+    """
+
+    code: int
+
+    def __str__(self) -> str:
+        return f"<special {self.code:02x}>"
+
+
+SPECIAL_64 = Special(0x64)
+SPECIAL_65 = Special(0x65)
+_SPECIALS = {s.code: s for s in (SPECIAL_64, SPECIAL_65)}
+
+#: One row: a double, a string (``bytes`` when it is not valid UTF-8), a special
+#: code, ``None`` for integer 0 ("none"), or an ``int`` that could not be resolved.
+Value = float | str | bytes | Special | int | None
+
+
+class Undecoded(StrEnum):
+    """Why a payload failed to parse."""
+
+    KIND = "payload kind is neither 05 nor 04"
+    TRUNCATED = "payload ends inside a segment, token or value"
+    SELECTOR = "segment starts with neither FF FF nor selector 0 or 1"
+    OVERFILL = "token holds more rows than its segment has left"
+    ROW_COUNT = "segments do not hold exactly the payload's row count"
+    COMPACT_CODE = "compact-double code has no established width"
     TABLE_BITS = "FPC table size is not the established 12 bits"
-    OVERRUN = "FPC block overruns the token stream"
+    OVERRUN = "FPC block overruns the payload"
+
+
+@dataclass(frozen=True)
+class Segment:
+    """One payload segment. ``selector`` is true for the single-value form."""
+
+    rows: int
+    flag: int
+    selector: bool
+
+
+@dataclass(frozen=True)
+class StringSection:
+    """A string section: integer columns refer to its strings by offset."""
+
+    offset: int
+    usize: int
+    #: The decoded header's fields, whose meaning is not fully established.
+    count: int = 0
+    byte_count: int = 0
+    rows: int = 0
+    #: Each string by its offset; ``bytes`` when it is not valid UTF-8.
+    strings: dict[int, str | bytes] = field(default_factory=dict)
+    #: Why ``strings`` is empty when the section could not be decoded.
+    undecoded: str | None = None
 
 
 @dataclass(frozen=True)
 class Column:
-    """One column payload located by a validated descriptor."""
+    """One column: its coded record, descriptor, and decoded payload."""
 
-    offset: int  # file offset of the descriptor
+    offset: int  # file offset of the descriptor's ``18``
     payload_offset: int
     payload_length: int
-    #: The nearest preceding name record since the previous payload; best-effort.
-    name: str | None
-    #: Head fields of a 05 payload that has FF FF, else ``None``.
+    #: The record's file offset (its ``80 <n>`` frame) and expanded bytes.
+    record_offset: int | None = None
+    record: bytes | None = None
+    name: str | None = None
+    #: Why ``name`` is ``None``: no frame expands to 147 bytes, or a bad name.
+    record_problem: str | None = None
+    kind: int | None = None
+    #: The payload's row count; ``values`` holds this many unless undecoded.
     a: int | None = None
-    b: int | None = None
-    head_byte: int | None = None
-    values: tuple[float, ...] = ()
-    #: Bytes between the end of an FPC block and the payload's end marker.
-    trailing: bytes = b""
+    segments: tuple[Segment, ...] = ()
+    values: tuple[Value, ...] = ()
+    #: Raw integers aligned to rows, ``None`` on other rows; empty if there are none.
+    integers: tuple[int | None, ...] = ()
+    #: The section integers were resolved through; the rule is a hypothesis.
+    string_section_offset: int | None = None
+    #: Rows whose integer stayed unresolved in ``values``, and why.
+    unresolved_rows: int = 0
+    resolution_problem: str | None = None
     undecoded: Undecoded | None = None
 
 
@@ -165,26 +238,68 @@ class Document:
 
     header: Header
     root_header: bytes
-    #: Records of the clean document-header TLV (from body+7 to the first gap).
-    header_records: list[Record] = field(default_factory=list)
-    #: All value records recovered from the body by the resync walk (§2), in
-    #: file order, skipping the opaque embedded-asset regions.
-    records: list[Record] = field(default_factory=list)
-    #: Length-prefixed text records (object names, comments) — the text subset
-    #: of ``records``.
+    #: Literal runs of text found by scanning: candidates, and they include text
+    #: from stored XML, so treat them as inventory evidence and do not print them.
     names: list[Record] = field(default_factory=list)
-    #: (offset, note) for regions the reader does not yet decode.
-    gaps: list[tuple[int, str]] = field(default_factory=list)
     #: ``None`` when the preview field or the header's framing is absent.
     global_header: GlobalHeader | None = None
     #: ``None`` when the preview field is absent.
     asset_directory: AssetDirectory | None = None
-    #: Column payloads in file order, decoded or marked undecoded.
+    string_sections: list[StringSection] = field(default_factory=list)
+    #: Column payloads in file order.
     columns: list[Column] = field(default_factory=list)
+    #: The settings document's raw UTF-8 bytes. Its values can hold local paths and
+    #: usernames from other machines: do not log or copy them.
+    settings_xml: bytes | None = None
 
     @property
     def name_strings(self) -> list[str]:
         return [r.text for r in self.names if r.text is not None]
+
+
+# --- the run-length layer ---------------------------------------------------
+
+
+def iter_expanded(
+    data: bytes, start: int = 0, end: int | None = None
+) -> Iterator[bytes]:
+    """Yield the expansion of each token in ``data[start:end]``."""
+    pos = start
+    stop = len(data) if end is None else end
+    while pos < stop:
+        token = data[pos]
+        pos += 1
+        if token < ZERO_RUN_MIN:
+            if pos + token > stop:
+                raise RunLengthError(f"literal run overruns at offset {pos - 1}")
+            yield data[pos : pos + token]
+            pos += token
+        elif token < BYTE_RUN_MIN:
+            yield bytes((token & RUN_LENGTH_MASK) + ZERO_RUN_BASE)
+        else:
+            if pos >= stop:
+                raise RunLengthError(f"byte run has no operand at offset {pos - 1}")
+            yield data[pos : pos + 1] * ((token & RUN_LENGTH_MASK) + BYTE_RUN_BASE)
+            pos += 1
+
+
+def expand(data: bytes, start: int = 0, end: int | None = None) -> bytes:
+    """Expand run-length tokens into the logical byte stream (spec §2.1)."""
+    return b"".join(iter_expanded(data, start, end))
+
+
+def _ends_in_zero_run(data: bytes, start: int, end: int) -> bool:
+    """Whether tokens from ``start`` land exactly on ``end`` on a zero-run token."""
+    pos = start
+    token = 0
+    while pos < end:
+        token = data[pos]
+        pos += 1
+        if token < ZERO_RUN_MIN:
+            pos += token
+        elif token >= BYTE_RUN_MIN:
+            pos += 1
+    return pos == end and ZERO_RUN_MIN <= token < BYTE_RUN_MIN
 
 
 # --- parsing ---------------------------------------------------------------
@@ -223,118 +338,22 @@ def root_header(data: bytes, header: Header) -> bytes:
     return data[start:end]
 
 
-def iter_header_records(data: bytes, start: int) -> Iterator[Record]:
-    """Yield value records from ``start`` until the first non-value tag.
-
-    Walks the clean document-header TLV. Stops at the first byte that is not a
-    ``0x80-0x9F`` tag (the first opaque / embedded-asset region).
-    """
-    i = start
-    n = len(data)
-    while i + 1 < n:
-        tag = data[i]
-        if not (TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX):
-            return
-        length = data[i + 1]
-        payload = data[i + 2 : i + 2 + length]
-        if len(payload) < length:  # truncated
-            return
-        yield Record(offset=i, tag=tag, length=length, payload=payload)
-        i += 2 + length
-
-
-def _record_at(data: bytes, i: int, max_len: int) -> Record | None:
-    """Parse a value record at ``i``, or ``None`` if the framing does not hold."""
-    n = len(data)
-    if i + 1 >= n:
-        return None
-    tag = data[i]
-    if not (TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX):
-        return None
-    length = data[i + 1]
-    if length > max_len or i + 2 + length > n:
-        return None
-    return Record(
-        offset=i, tag=tag, length=length, payload=data[i + 2 : i + 2 + length]
-    )
-
-
-def iter_records(
-    data: bytes, start: int, run: int = 4, max_len: int = 0x60
-) -> Iterator[Record]:
-    """Walk the body as value records, resyncing across opaque regions.
-
-    Parses ``[tag 0x80-0x9F][length][payload]`` records forward. On a byte that
-    is not a value record (an embedded-asset / binary-data region), scans forward
-    one byte at a time until ``run`` consecutive records parse cleanly, then
-    resumes there. This recovers the document skeleton and the object-name
-    inventory despite the binary blobs that interrupt a naive linear walk.
-
-    Caveat: records that fall *inside* a binary data/asset sub-blob may be
-    coincidental, not real fields. Only distinctive text (names, comments) is
-    reliable; callers validate against an expected inventory rather than trusting
-    every record. See docs/engineering-spec.md §2.6.
-    """
-    n = len(data)
-    i = start
-    while i + 1 < n:
-        rec = _record_at(data, i, max_len)
-        if rec is not None:
-            yield rec
-            i += 2 + rec.length
-            continue
-        # opaque region: find the next point where `run` records parse cleanly
-        j = i + 1
-        while j + 1 < n:
-            p = j
-            ok = 0
-            while ok < run:
-                r = _record_at(data, p, max_len)
-                if r is None:
-                    break
-                p += 2 + r.length
-                ok += 1
-            if ok >= run:
-                break
-            j += 1
-        if j + 1 >= n:
-            return
-        i = j
-
-
-def _find_gaps(data: bytes, records: list[Record], start: int) -> list[tuple[int, str]]:
-    """Report the opaque spans between recovered records, plus the preview."""
-    gaps: list[tuple[int, str]] = []
-    cursor = start
-    for r in records:
-        if r.offset > cursor:
-            gaps.append((cursor, f"opaque region ({r.offset - cursor} bytes)"))
-        cursor = r.offset + 2 + r.length
-    if cursor < len(data):
-        gaps.append((cursor, f"trailing region ({len(data) - cursor} bytes)"))
-    marker = data.find(PREVIEW_MARKER)
-    if marker >= 0:
-        gaps.append((marker, "preview field (PrvwOPJU)"))
-    return gaps
-
-
 def scan_named_records(
     data: bytes, start: int, min_len: int = 4, max_len: int = 0x7F
 ) -> list[Record]:
-    """Globally scan for length-prefixed text records (object names, comments).
+    """Scan for text held in literal runs (spec §2.2), without expanding the stream.
 
-    Robust to the opaque embedded-asset regions that interrupt a linear walk:
-    advances one byte at a time, accepting a ``[tag][len][len printable bytes]``
-    record wherever the framing holds. May include occasional coincidental
-    matches; callers validate against an expected inventory rather than trusting
-    every hit.
+    Advances one byte at a time, accepting a zero-run token followed by a literal
+    count and that many printable bytes. Names and comments are found this way,
+    and so are coincidental matches and pieces of stored XML; callers validate
+    against an expected inventory rather than trusting every hit.
     """
     out: list[Record] = []
     i = start
     n = len(data)
     while i + 1 < n:
         tag = data[i]
-        if TAG_VALUE_MIN <= tag <= TAG_VALUE_MAX:
+        if ZERO_RUN_MIN <= tag < BYTE_RUN_MIN:
             length = data[i + 1]
             if min_len <= length <= max_len and i + 2 + length <= n:
                 payload = data[i + 2 : i + 2 + length]
@@ -412,94 +431,246 @@ def parse_asset_directory(data: bytes) -> AssetDirectory | None:
     return AssetDirectory(offset, count, table_bytes, entries)
 
 
-def _leb128(data: bytes, pos: int) -> tuple[int, int] | None:
+def _text(raw: bytes) -> str | bytes:
+    """Decode a stored string as UTF-8, leaving it as bytes if it is not valid."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw
+
+
+# --- column payloads --------------------------------------------------------
+
+
+class _Malformed(Exception):
+    def __init__(self, reason: Undecoded) -> None:
+        self.reason = reason
+
+
+def _leb128(stream: bytes, pos: int) -> tuple[int, int]:
     """Read a LEB128 varint at ``pos``: its value and the offset after it."""
     value = 0
     shift = 0
-    while pos < len(data):
-        byte = data[pos]
+    while pos < len(stream):
+        byte = stream[pos]
         pos += 1
         value |= (byte & 0x7F) << shift
         shift += 7
         if not byte & 0x80:
             return value, pos
-    return None
+    raise _Malformed(Undecoded.TRUNCATED)
 
 
-class _Payload(NamedTuple):
-    a: int | None = None
-    b: int | None = None
-    head_byte: int | None = None
-    values: tuple[float, ...] = ()
-    trailing: bytes = b""
-    undecoded: Undecoded | None = None
-
-
-def _decode_payload(payload: bytes) -> _Payload:
-    """Decode a column payload, including its two-byte end marker."""
-    if payload[0] == 0x04:
-        return _Payload(undecoded=Undecoded.PAYLOAD_04)
-    if payload[0] != 0x05:
-        return _Payload(undecoded=Undecoded.PAYLOAD_UNKNOWN)
-    stream = payload[: -len(COLUMN_PAYLOAD_END)]
-
-    head = _leb128(stream, 1)
-    if head is None or stream[head[1] : head[1] + 2] != b"\xff\xff":
-        return _Payload(undecoded=Undecoded.NO_MARKER)
-    a, pos = head
-    head = _leb128(stream, pos + 2)
-    if head is None or head[1] >= len(stream):
-        return _Payload(undecoded=Undecoded.MALFORMED_HEAD)
-    b, pos = head
-    parsed = _Payload(a, b, stream[pos])
-
-    token = _leb128(stream, pos + 1)
-    if token is None:
-        return parsed._replace(undecoded=Undecoded.MALFORMED_HEAD)
-    v, pos = token
-    if not v & 1:
-        return parsed._replace(undecoded=Undecoded.RUN_TOKEN)
-    if (v >> 1) + 1 != b:
-        return parsed._replace(undecoded=Undecoded.COUNT_MISMATCH)
+def _compact_double(stream: bytes, pos: int) -> tuple[float | Special, int]:
+    """Read a code byte and the high bytes of a double whose low bytes are zero."""
     if pos >= len(stream):
-        return parsed._replace(undecoded=Undecoded.MALFORMED_HEAD)
-    if stream[pos] != COLUMN_FPC_TABLE_BITS:
-        return parsed._replace(undecoded=Undecoded.TABLE_BITS)
+        raise _Malformed(Undecoded.TRUNCATED)
+    code = stream[pos]
+    pos += 1
+    special = _SPECIALS.get(code)
+    if special is not None:
+        return special, pos
+    width, remainder = divmod(code - 8, 9)
+    if remainder or not 1 <= width <= 8:
+        raise _Malformed(Undecoded.COMPACT_CODE)
+    if pos + width > len(stream):
+        raise _Malformed(Undecoded.TRUNCATED)
+    raw = bytes(8 - width) + stream[pos : pos + width]
+    return struct.unpack("<d", raw)[0], pos + width
+
+
+def _string(stream: bytes, pos: int) -> tuple[str | bytes, int]:
+    length, pos = _leb128(stream, pos)
+    if pos + length > len(stream):
+        raise _Malformed(Undecoded.TRUNCATED)
+    return _text(stream[pos : pos + length]), pos + length
+
+
+def _single(stream: bytes, pos: int, kind: int, flag: int) -> tuple[Value, int]:
+    """Read one value of the type that the flag and kind select."""
+    if flag != FLAG_NON_DOUBLE:
+        return _compact_double(stream, pos)
+    if kind == KIND_STRING:
+        return _string(stream, pos)
+    return _leb128(stream, pos)
+
+
+def _literals(
+    stream: bytes, pos: int, kind: int, flag: int, count: int
+) -> tuple[list[Value], int]:
+    """Read a token's literal values: an FPC block, or values one after another."""
+    if flag != FLAG_NON_DOUBLE:
+        if pos >= len(stream):
+            raise _Malformed(Undecoded.TRUNCATED)
+        if stream[pos] != COLUMN_FPC_TABLE_BITS:
+            raise _Malformed(Undecoded.TABLE_BITS)
+        try:
+            doubles, pos = fpc.decode(stream, count, COLUMN_FPC_TABLE_BITS, pos + 1)
+        except fpc.FpcError as exc:
+            raise _Malformed(Undecoded.OVERRUN) from exc
+        return list(doubles), pos
+    values: list[Value] = []
+    for _ in range(count):
+        value, pos = _single(stream, pos, kind, flag)
+        values.append(value)
+    return values, pos
+
+
+def _segments(
+    stream: bytes, pos: int, kind: int, a: int
+) -> tuple[list[Segment], list[Value]]:
+    """Read segments to the end of ``stream``, holding exactly ``a`` rows."""
+    segments: list[Segment] = []
+    rows: list[Value] = []
+    while pos < len(stream):
+        mark = stream[pos : pos + 2]
+        if mark in (b"\x00\x00", b"\x01\x00"):
+            flag = mark[0]
+            value, pos = _single(stream, pos + 2, kind, flag)
+            rows.append(value)
+            segments.append(Segment(1, flag, True))
+        elif mark == b"\xff\xff":
+            n, pos = _leb128(stream, pos + 2)
+            if pos >= len(stream):
+                raise _Malformed(Undecoded.TRUNCATED)
+            flag = stream[pos]
+            pos += 1
+            if len(rows) + n > a:
+                raise _Malformed(Undecoded.ROW_COUNT)
+            filled = 0
+            while filled < n:
+                v, pos = _leb128(stream, pos)
+                count = (v >> 1) + 1 if v & 1 else v >> 1
+                if filled + count > n:
+                    raise _Malformed(Undecoded.OVERFILL)
+                if v & 1:
+                    literal, pos = _literals(stream, pos, kind, flag, count)
+                    rows += literal
+                else:
+                    value, pos = _single(stream, pos, kind, flag)
+                    rows += [value] * count
+                filled += count
+            segments.append(Segment(n, flag, False))
+        elif len(mark) < 2:
+            raise _Malformed(Undecoded.TRUNCATED)
+        else:
+            raise _Malformed(Undecoded.SELECTOR)
+    if len(rows) != a:
+        raise _Malformed(Undecoded.ROW_COUNT)
+    return segments, rows
+
+
+def _resolve(
+    rows: list[Value], sections: list[StringSection], payload_end: int
+) -> tuple[list[Value], int | None, int, str | None]:
+    """Resolve integer rows through the first string section after the payload.
+
+    Returns the rows, the section's offset, the count of rows left as integers,
+    and why they were. Integer 0 means none and becomes ``None``.
+    """
+    integer_rows = sum(1 for row in rows if isinstance(row, int))
+    index = bisect.bisect_left([s.offset for s in sections], payload_end)
+    if index == len(sections):
+        return rows, None, integer_rows, "no string section after the payload"
+    section = sections[index]
+    if section.undecoded is not None:
+        return rows, section.offset, integer_rows, section.undecoded
+
+    resolved: list[Value] = []
+    misses = 0
+    for row in rows:
+        if not isinstance(row, int):
+            resolved.append(row)
+        elif row == 0:
+            resolved.append(None)
+        elif row - 1 in section.strings:
+            resolved.append(section.strings[row - 1])
+        else:
+            misses += 1
+            resolved.append(row)
+    problem = f"{misses} integers are not on a string start" if misses else None
+    return resolved, section.offset, misses, problem
+
+
+def _decode_payload(
+    payload: bytes,
+    payload_end: int,
+    sections: list[StringSection],
+) -> dict[str, Any]:
+    """Decode a payload, including its end marker, into ``Column`` fields."""
+    stream = payload[: -len(COLUMN_PAYLOAD_END)]
+    kind = stream[0] if stream else None
+    if kind not in (KIND_STRING, KIND_INTEGER):
+        return {"undecoded": Undecoded.KIND}
+    a = None
     try:
-        values, end = fpc.decode(stream, b, COLUMN_FPC_TABLE_BITS, pos + 1)
-    except fpc.FpcError:
-        return parsed._replace(undecoded=Undecoded.OVERRUN)
-    return parsed._replace(values=tuple(values), trailing=stream[end:])
+        a, pos = _leb128(stream, 1)
+        segments, rows = _segments(stream, pos, kind, a)
+    except _Malformed as exc:
+        return {"kind": kind, "a": a, "undecoded": exc.reason}
+
+    fields: dict[str, Any] = {"kind": kind, "a": a, "segments": tuple(segments)}
+    if any(isinstance(row, int) for row in rows):
+        fields["integers"] = tuple(r if isinstance(r, int) else None for r in rows)
+        rows, offset, unresolved, problem = _resolve(rows, sections, payload_end)
+        fields["string_section_offset"] = offset
+        fields["unresolved_rows"] = unresolved
+        fields["resolution_problem"] = problem
+    fields["values"] = tuple(rows)
+    return fields
 
 
-def _nearest_name(data: bytes, start: int, end: int) -> str | None:
-    """The last text record in ``data[start:end]``, if any."""
-    if start >= end:
-        return None
-    records = scan_named_records(data[start:end], 0)
-    return records[-1].text if records else None
+# --- column records ---------------------------------------------------------
 
 
-def parse_columns(data: bytes, start: int = 0) -> list[Column]:
-    """Locate column payloads by descriptor, rejecting coincidental matches.
+def _record_fields(data: bytes, descriptor: int, start: int) -> dict[str, Any]:
+    """Find a column's coded record: the nearest frame that expands to 147 bytes.
+
+    ``80 <n>`` can also occur by coincidence inside the coded bytes, so a nearer
+    frame of another size is skipped rather than accepted.
+    """
+    for n in range(1, 256):
+        frame = descriptor - n - 2
+        if frame < start:
+            break
+        if data[frame] != COLUMN_RECORD_FRAME or data[frame + 1] != n:
+            continue
+        if not _ends_in_zero_run(data, frame + 2, descriptor):
+            continue
+        record = expand(data, frame + 2, descriptor)
+        if len(record) != COLUMN_RECORD_SIZE:
+            continue
+        return {"record_offset": frame, "record": record, **_record_name(record)}
+    return {"record_problem": f"no frame expands to {COLUMN_RECORD_SIZE} bytes"}
+
+
+def _record_name(record: bytes) -> dict[str, Any]:
+    name = _text(record[COLUMN_NAME_OFFSET:].split(b"\x00", 1)[0])
+    if not name or isinstance(name, bytes):
+        return {"record_problem": "no UTF-8 name at the name offset"}
+    return {"name": name}
+
+
+def parse_columns(
+    data: bytes, start: int = 0, sections: list[StringSection] | None = None
+) -> list[Column]:
+    """Locate columns by descriptor, rejecting coincidental matches.
 
     A match counts only if its separator byte is in place, its stated length
     fits in the file, and that length ends on the payload end marker.
     """
     columns: list[Column] = []
-    previous_end = start
     for match in COLUMN_DESCRIPTOR.finditer(data, start):
-        offset = match.start()
+        offset = match.start() + 1
         payload_offset = offset + COLUMN_DESCRIPTOR_LEN
         if payload_offset > len(data) or data[payload_offset - 1] != 0x0A:
             continue
-        length = int.from_bytes(data[offset + 10 : offset + 18], "little")
+        length = int.from_bytes(data[offset + 9 : offset + 17], "little")
         payload_end = payload_offset + length
         if payload_end > len(data) or length < len(COLUMN_PAYLOAD_END):
             continue
-        if (
-            data[payload_end - len(COLUMN_PAYLOAD_END) : payload_end]
-            != COLUMN_PAYLOAD_END
+        if data[payload_end - len(COLUMN_PAYLOAD_END) : payload_end] != (
+            COLUMN_PAYLOAD_END
         ):
             continue
         columns.append(
@@ -507,12 +678,111 @@ def parse_columns(data: bytes, start: int = 0) -> list[Column]:
                 offset=offset,
                 payload_offset=payload_offset,
                 payload_length=length,
-                name=_nearest_name(data, previous_end, offset),
-                **_decode_payload(data[payload_offset:payload_end])._asdict(),
+                **_record_fields(data, offset, start),
+                **_decode_payload(
+                    data[payload_offset:payload_end], payload_end, sections or []
+                ),
             )
         )
-        previous_end = payload_end
     return columns
+
+
+# --- string sections --------------------------------------------------------
+
+
+def _decode_string_block(block: bytes, usize: int) -> dict[str, Any]:
+    try:
+        decoded = lz4.decode_block(block, usize)
+    except lz4.Lz4Error as exc:
+        return {"undecoded": f"LZ4 block: {exc}"}
+    if len(decoded) < STRING_HEADER.size:
+        return {"undecoded": "decoded section is shorter than its header"}
+    magic, version, kind, width, count, byte_count, rows = STRING_HEADER.unpack_from(
+        decoded
+    )
+    if (magic, version, kind, width) != (STRING_HEADER_MAGIC, 2, 1, 4):
+        return {"undecoded": "decoded section header is not the established form"}
+
+    strings: dict[int, str | bytes] = {}
+    body = decoded[STRING_HEADER.size :]
+    offset = 0
+    while offset < len(body):
+        end = body.find(b"\x00", offset)
+        end = len(body) if end < 0 else end
+        strings[offset] = _text(body[offset:end])
+        offset = end + 1
+    return {"count": count, "byte_count": byte_count, "rows": rows, "strings": strings}
+
+
+def _string_section(data: bytes, offset: int, head_end: int) -> StringSection:
+    def failed(reason: str, usize: int = 0) -> StringSection:
+        return StringSection(offset, usize, undecoded=reason)
+
+    try:
+        csize, pos = _leb128(data, head_end)
+    except _Malformed:
+        return failed("compressed size is truncated")
+    if pos + 5 > len(data) or data[pos] != 0x00:
+        return failed("separator byte is not in place")
+    usize = int.from_bytes(data[pos + 1 : pos + 5], "little")
+    block_start = pos + 5
+    # csize is the block's length plus 4, for usize.
+    block_end = pos + 1 + csize
+    if csize < 4 or block_end > len(data):
+        return failed(f"compressed size {csize} does not fit", usize)
+    return StringSection(
+        offset,
+        usize,
+        **_decode_string_block(data[block_start:block_end], usize),
+    )
+
+
+def parse_string_sections(data: bytes, start: int = 0) -> list[StringSection]:
+    """Decode each string section, in file order. Failures are recorded, not raised."""
+    return [
+        _string_section(data, match.start(), match.end())
+        for match in STRING_SECTION.finditer(data, start)
+    ]
+
+
+# --- settings document ------------------------------------------------------
+
+
+def _expand_to_nul(data: bytes, start: int) -> bytes | None:
+    """Expand from ``start`` up to the first NUL, or ``None`` if there is none."""
+    out = bytearray()
+    try:
+        for chunk in iter_expanded(data, start):
+            nul = chunk.find(0)
+            if nul >= 0:
+                out += chunk[:nul]
+                return bytes(out)
+            out += chunk
+    except RunLengthError:
+        return None
+    return None
+
+
+def parse_settings_xml(data: bytes, start: int = 0) -> bytes | None:
+    """Return the first well-formed settings document, as raw UTF-8 bytes.
+
+    Its root opens a literal run that follows a zero-run token. Other occurrences
+    of the root's text in a file are not at such a position or do not parse.
+    """
+    at = data.find(SETTINGS_ROOT, start + 2)
+    while at >= 0:
+        token = data[at - 1]
+        if token < ZERO_RUN_MIN and ZERO_RUN_MIN <= data[at - 2] < BYTE_RUN_MIN:
+            document = _expand_to_nul(data, at - 1)
+            if document is not None:
+                try:
+                    ElementTree.fromstring(document)
+                except ElementTree.ParseError:
+                    pass
+                else:
+                    return document
+        at = data.find(SETTINGS_ROOT, at + 1)
+    return None
 
 
 def parse(data: bytes) -> Document:
@@ -520,22 +790,17 @@ def parse(data: bytes) -> Document:
     header = parse_header(data)
     root = root_header(data, header)
     stream_start = header.body_offset + ROOT_HEADER_LEN
-
-    header_records = list(iter_header_records(data, stream_start))
-    records = list(iter_records(data, stream_start))
-
-    doc = Document(
+    sections = parse_string_sections(data, stream_start)
+    return Document(
         header=header,
         root_header=root,
-        header_records=header_records,
-        records=records,
+        names=scan_named_records(data, stream_start),
+        global_header=parse_global_header(data),
+        asset_directory=parse_asset_directory(data),
+        string_sections=sections,
+        columns=parse_columns(data, stream_start, sections),
+        settings_xml=parse_settings_xml(data, stream_start),
     )
-    doc.names = [r for r in records if r.is_text and r.length >= 4]
-    doc.gaps = _find_gaps(data, records, stream_start)
-    doc.global_header = parse_global_header(data)
-    doc.asset_directory = parse_asset_directory(data)
-    doc.columns = parse_columns(data, stream_start)
-    return doc
 
 
 def read(path: str | Path) -> Document:

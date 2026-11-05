@@ -1,74 +1,34 @@
-"""Reproduce the specification's corpus figures.
+"""Reproduce the specification's corpus counts.
 
 Set ``OPJ_CORPUS`` to a flat directory holding the 98 public files named in
-docs/engineering-spec.md §3. Every expected value here is the figure the
-specification states.
+docs/engineering-spec.md §3. Every expected value here is a figure the
+specification states, unless its comment says otherwise.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import xml.etree.ElementTree as ElementTree
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
-from opj import AssetDirectory, Column, Undecoded, parse
+from opj import (
+    SPECIAL_64,
+    SPECIAL_65,
+    AssetDirectory,
+    Column,
+    Document,
+    RunLengthError,
+    StringSection,
+    parse,
+)
+from opj.opju import SETTINGS_ROOT, STRING_HEADER, iter_expanded
 
 _DESCRIPTOR_HEAD = re.compile(rb"[\x80-\x9f]\x18\x18\x00{7}")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
-def _leb128(data: bytes, pos: int) -> tuple[int, int] | None:
-    value = 0
-    shift = 0
-    while pos < len(data):
-        byte = data[pos]
-        pos += 1
-        value |= (byte & 0x7F) << shift
-        shift += 7
-        if not byte & 0x80:
-            return value, pos
-    return None
-
-
-def _run_stream_shape(stream: bytes, width: int) -> tuple[int, int] | None:
-    """Sum and count of a stream read as runs of ``width``-byte values, if it is."""
-    pos = 0
-    total = 0
-    runs = 0
-    while pos < len(stream):
-        token = _leb128(stream, pos)
-        if token is None or token[0] & 1:
-            return None
-        total += token[0] >> 1
-        pos = token[1] + width
-        runs += 1
-    return (total, runs) if pos == len(stream) else None
-
-
-def _token_stream(data: bytes, column: Column) -> bytes:
-    payload = data[
-        column.payload_offset : column.payload_offset + column.payload_length - 2
-    ]
-    first = _leb128(payload, 1)
-    assert first is not None
-    second = _leb128(payload, first[1] + 2)
-    assert second is not None
-    return payload[second[1] + 1 :]
-
-
-def _count_run_streams(data: bytes, column: Column, counts: Counter[str]) -> None:
-    stream = _token_stream(data, column)
-    for width in (1, 2, 4, 8):
-        shape = _run_stream_shape(stream, width)
-        if shape is not None and shape[0] == column.b:
-            counts["runs_sum_to_b"] += 1
-            if width == 1 and shape[1] == 1:
-                counts["runs_single_of_1_byte"] += 1
-            return
-    counts["runs_other"] += 1
 
 
 def _count_directory(
@@ -98,62 +58,140 @@ def _count_directory(
         counts["directory_neither"] += 1
 
 
+def _count_values(column: Column, counts: Counter[str]) -> None:
+    for value, integer in zip(
+        column.values, column.integers or [None] * len(column.values), strict=True
+    ):
+        if integer is not None:
+            counts["rows_integer"] += 1
+        elif value == SPECIAL_64:
+            counts["rows_special_64"] += 1
+        elif value == SPECIAL_65:
+            counts["rows_special_65"] += 1
+        elif isinstance(value, float):
+            counts["rows_double"] += 1
+        elif isinstance(value, str | bytes):
+            counts["rows_string"] += 1
+        else:
+            counts["rows_other"] += 1
+
+
 def _count_column(data: bytes, column: Column, counts: Counter[str]) -> None:
     counts["ce_fa_ended"] += 1
-    form = data[column.payload_offset]
-    counts["payload_05"] += form == 0x05
-    counts["payload_04"] += form == 0x04
-    counts["payload_05_no_marker"] += column.undecoded is Undecoded.NO_MARKER
-    if column.a is None or column.b is None:
-        return
+    counts["undecoded"] += column.undecoded is not None
+    counts["rows_equal_a"] += (
+        column.undecoded is None and len(column.values) == column.a
+    )
+    counts["payload_05"] += column.kind == 0x05
+    counts["payload_04"] += column.kind == 0x04
 
-    counts["heads"] += 1
-    counts["a_eq_b"] += column.a == column.b
-    counts["a_gt_b"] += column.a > column.b
-    counts["a_lt_b"] += column.a < column.b
-    counts["head_byte_00"] += column.head_byte == 0
-    if column.undecoded is Undecoded.RUN_TOKEN:
-        counts["even_first"] += 1
-        _count_run_streams(data, column, counts)
-        return
+    size = None if column.record is None else len(column.record)
+    counts["record_147"] += size == 147
+    # The name is what sits at the stated offset, and the reader took it from there.
+    if column.record is not None and column.name is not None:
+        name = column.name.encode()
+        counts["name_at_0x58"] += size == 147 and column.record[0x58:].startswith(name)
+    frames = sum(
+        1
+        for n in range(1, 256)
+        if column.offset - n - 2 >= 0
+        and data[column.offset - n - 2] == 0x80
+        and data[column.offset - n - 1] == n
+    )
+    counts["columns_with_several_frames"] += frames > 1
 
-    counts["odd_first"] += 1
-    if column.undecoded is Undecoded.COUNT_MISMATCH:
-        counts["block_count_differs"] += 1
-        return
-    counts["block_count_is_b"] += 1
-    counts["table_bits_12"] += column.undecoded is not Undecoded.TABLE_BITS
-    if column.undecoded is not None:
-        return
+    for segment in column.segments:
+        if segment.selector:
+            counts[f"segments_selector_{segment.flag}"] += 1
+        else:
+            counts["segments_ff_ff"] += 1
+            counts["segments_flag_0_kind_05"] += (
+                segment.flag == 0 and column.kind == 0x05
+            )
+            counts["segments_flag_0_kind_04"] += (
+                segment.flag == 0 and column.kind == 0x04
+            )
+            counts["segments_flag_3"] += segment.flag == 3
 
-    counts["fpc_decoded"] += 1
-    trailing = column.trailing
-    counts["fpc_exact"] += not trailing
-    counts["fpc_trailing"] += bool(trailing)
-    if trailing:
-        assert column.a is not None and column.b is not None
-        empty = column.a - column.b
-        form = b"\xff\xff" + _enc(empty) + b"\x01" + _enc(2 * empty) + b"\x00"
-        is_empty_rows = trailing == form
-        counts["trailer_empty_rows"] += is_empty_rows
-        counts["trailer_empty_rows_6_bytes"] += is_empty_rows and len(trailing) == 6
-        counts["trailer_empty_rows_8_bytes"] += is_empty_rows and len(trailing) == 8
-        counts["trailer_other"] += not is_empty_rows
+    _count_values(column, counts)
+
+    if column.integers:
+        has_run_segment = any(s.flag == 1 and not s.selector for s in column.segments)
+        counts["integer_columns"] += 1
+        counts["integer_columns_on_string_starts"] += column.resolution_problem is None
+        counts["integer_columns_in_run_segments"] += has_run_segment
+        counts["integer_columns_only_in_selector_segments"] += not has_run_segment
 
 
-def _enc(value: int) -> bytes:
+def _count_section(section: StringSection, counts: Counter[str]) -> None:
+    counts["string_sections"] += 1
+    counts["lz4_exact"] += section.undecoded is None
+    counts["section_count_is_strings"] += section.count == len(section.strings)
+    string_bytes = section.usize - STRING_HEADER.size
+    counts["section_bytes_is_string_bytes"] += section.byte_count == string_bytes
+
+
+def _expanded_to_nul(data: bytes, start: int) -> bytes | None:
     out = bytearray()
-    while value > 0x7F:
-        out.append(value & 0x7F | 0x80)
-        value >>= 7
-    out.append(value)
-    return bytes(out)
+    try:
+        for chunk in iter_expanded(data, start):
+            nul = chunk.find(0)
+            if nul >= 0:
+                return bytes(out + chunk[:nul])
+            out += chunk
+    except RunLengthError:
+        pass
+    return None
+
+
+def _well_formed_documents(data: bytes) -> list[bytes]:
+    """Every document of the settings form. Callers keep only shapes, not values.
+
+    The root can sit inside a literal run that follows a zero-run token, so each
+    literal token that could hold it is tried.
+    """
+    documents = []
+    at = data.find(SETTINGS_ROOT, 2)
+    while at >= 0:
+        for before in range(128):
+            token_at = at - 1 - before
+            if token_at < 1:
+                break
+            token = data[token_at]
+            if not before < token < 0x80 or not 0x80 <= data[token_at - 1] < 0xC0:
+                continue
+            expanded = _expanded_to_nul(data, token_at)
+            if expanded is None or not expanded.startswith(SETTINGS_ROOT, before):
+                continue
+            try:
+                ElementTree.fromstring(expanded[before:])
+            except ElementTree.ParseError:
+                continue
+            documents.append(expanded[before:])
+            break
+        at = data.find(SETTINGS_ROOT, at + 1)
+    return documents
+
+
+def _count_settings(
+    data: bytes, doc: Document, counts: Counter[str], tools: set[str]
+) -> None:
+    if doc.settings_xml is None:
+        return
+    root = ElementTree.fromstring(doc.settings_xml)
+    counts["settings_well_formed"] += 1
+    counts["settings_origin_storage_root"] += root.tag == "OriginStorage"
+    tools.update(child.tag for child in root)
+
+    first, *_ = _well_formed_documents(data)
+    counts["settings_is_first_document"] += first == doc.settings_xml
 
 
 def _measure(corpus: Path) -> Counter[str]:
     counts: Counter[str] = Counter()
     format_versions = []
     versions = []
+    tools: set[str] = set()
     for path in sorted(corpus.iterdir()):
         data = path.read_bytes()
         doc = parse(data)
@@ -165,8 +203,12 @@ def _measure(corpus: Path) -> Counter[str]:
             counts["build_matches"] += doc.header.build == doc.global_header.build
             versions.append(doc.global_header.version)
         _count_directory(data, doc.asset_directory, counts)
+        for section in doc.string_sections:
+            _count_section(section, counts)
         for column in doc.columns:
             _count_column(data, column, counts)
+        _count_settings(data, doc, counts, tools)
+    counts["settings_tool_names"] = len(tools)
     counts["format_version_min"] = round(float(min(format_versions)) * 10_000)
     counts["format_version_max"] = round(float(max(format_versions)) * 10_000)
     counts["version_min"] = round(min(versions) * 100)
@@ -201,34 +243,44 @@ def measured() -> Counter[str]:
         ("directory_entries", 131),
         ("png_signatures_at_entry", 131),
         ("png_signatures", 135),
-        # §2.6 descriptors and payload forms
+        # §2.5
         ("candidates", 1039),
         ("ce_fa_ended", 903),
+        ("record_147", 903),
+        ("name_at_0x58", 903),
+        ("columns_with_several_frames", 6),
+        # §2.6 grammar
+        ("undecoded", 0),
+        ("rows_equal_a", 903),
         ("payload_05", 855),
         ("payload_04", 48),
-        ("payload_05_no_marker", 39),
-        ("heads", 816),
-        ("a_eq_b", 379),
-        ("a_gt_b", 437),
-        ("a_lt_b", 0),
-        ("head_byte_00", 786),
-        # §2.6 token stream
-        ("odd_first", 795),
-        ("block_count_is_b", 705),
-        ("block_count_differs", 90),
-        ("even_first", 21),
-        ("runs_sum_to_b", 14),
-        ("runs_single_of_1_byte", 12),
-        ("runs_other", 7),
-        # §2.6 FPC blocks
-        ("table_bits_12", 705),
-        ("fpc_decoded", 705),
-        ("fpc_exact", 294),
-        ("fpc_trailing", 411),
-        ("trailer_empty_rows", 391),
-        ("trailer_empty_rows_6_bytes", 384),
-        ("trailer_empty_rows_8_bytes", 7),
-        ("trailer_other", 20),
+        ("segments_ff_ff", 1323),
+        ("segments_selector_0", 110),
+        ("segments_selector_1", 48),
+        ("segments_flag_0_kind_05", 790),
+        ("segments_flag_0_kind_04", 1),
+        ("segments_flag_3", 1),
+        # §2.6 rows
+        ("rows_string", 18414),
+        ("rows_integer", 4602),
+        ("rows_double", 357062),
+        ("rows_special_64", 1366),
+        ("rows_special_65", 526),
+        ("rows_other", 0),
+        # §2.7
+        ("string_sections", 48),
+        ("lz4_exact", 48),
+        ("integer_columns", 48),
+        ("integer_columns_on_string_starts", 48),
+        ("integer_columns_in_run_segments", 46),
+        ("integer_columns_only_in_selector_segments", 2),
+        ("section_count_is_strings", 4),
+        ("section_bytes_is_string_bytes", 0),
+        # §2.8
+        ("settings_well_formed", 98),
+        ("settings_origin_storage_root", 98),
+        ("settings_tool_names", 225),
+        ("settings_is_first_document", 98),
     ],
 )
 def test_spec_figure(measured: Counter[str], figure: str, expected: int) -> None:

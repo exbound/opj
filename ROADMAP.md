@@ -13,31 +13,35 @@ samples with the coverage triplet (reference observed / implemented / verified).
 
 ## Done
 
-- Container + header line (`CPYUA <version> <object-count>`) and the per-document
+- Container + header line (`CPYUA <format-version> <build>`) and the per-document
   root header.
 - The `0x80–0x9F` TLV record form (strings + short scalars; compact-float).
 - **Object-name inventory**: a resync walk recovers worksheet/column and
   analysis-object names, with the new-object vs. continuation distinction —
   verified against two samples.
-- Established that the format is a **hybrid** of fixed-layout binary records and
-  TLV, and that bulk cell data lives in a per-object mechanism (not a plain
-  array).
+- Established that the format is a **hybrid** of fixed-layout blocks and TLV.
+- **Header model:** the third header token is the application build, confirmed
+  by the global-header version value across 98 public files.
+- **Numeric column data:** FPC-compressed blocks decode across the public corpus
+  (spec §2.6). Not yet compared with the reference application.
+- **Asset directory**, 16-byte form: locates embedded PNGs (spec §2.4).
 
 ## Phases
 
-1. **Record model.** Catalog the record types and pin the boundary between a
-   record's fixed-struct part and its TLV tail. Make the reader split a record
-   into (fixed fields, TLV tail, data sub-blob) deterministically.
-2. **Object tree.** Recover nesting and boundaries (folders → books → sheets →
-   columns; windows/graphs) and reconcile the recovered object count with the
-   header's `<object-count>`.
-3. **Per-object field schemas.** For each object type, map the positional field
-   schema (name, long name, comment, units, dimensions, flags, …).
-4. **Cell data.** Decode bulk numeric data: worksheet columns (1-D) first, then
-   matrices (2-D). This is the primary C2 data-recovery milestone.
-5. **Embedded assets.** Pin the length encoding for the preview bitmap and
-   embedded images; optionally extract them.
-6. **Legacy `.opj` delta.** Reconcile with existing open `.opj` readers; decide
+1. **Reference comparison.** Generate known-content files and compare decoded
+   values, turning the column-data result into a verified compatibility claim.
+2. **Remaining column forms.** Run values, `04` payloads, text columns, FPC
+   blocks with further tokens, trailers; then matrices (2-D). Completes the
+   primary C2 data-recovery milestone.
+3. **Analysis provenance.** Parse the stored-analysis XML (spec §2.8): operations
+   and input ranges, which no open reader recovers today.
+4. **Object tree.** Recover nesting and boundaries (folders → books → sheets →
+   columns; windows/graphs).
+5. **Per-object field schemas.** For each object type, map the positional field
+   schema (name, long name, comment, units, dimensions, flags, …), with a record
+   catalog as needed.
+6. **Embedded assets.** Pin the 36-byte directory form; optionally extract images.
+7. **Legacy `.opj` delta.** Reconcile with existing open `.opj` readers; decide
    what `opj` adds beyond them.
 
 ## How to help

@@ -40,6 +40,12 @@ def _show(value: Value) -> str:
 def _column_line(column: Column) -> str:
     name = column.name if column.name is not None else "?"
     where = f"  @{column.payload_offset:#08x} {name}"
+    if column.column_type is not None:
+        where += f" type={column.column_type.name}"
+    if column.long_name is not None:
+        where += f" long={column.long_name!r}"
+    if column.units is not None:
+        where += f" units={column.units!r}"
     if column.undecoded is not None:
         return f"{where} undecoded: {column.undecoded}"
     shown = ", ".join(_show(v) for v in column.values[:SHOWN_VALUES])
@@ -49,6 +55,8 @@ def _column_line(column: Column) -> str:
         line += f" (unresolved: {column.resolution_problem})"
     if column.record_problem is not None:
         line += f" (record: {column.record_problem})"
+    if column.curve_problem is not None:
+        line += f" (no type: {column.curve_problem})"
     return line
 
 

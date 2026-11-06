@@ -7,6 +7,7 @@ Public API:
     Header, Record, Document, OpjError, RunLengthError
     GlobalHeader, AssetDirectory, AssetEntry, StringSection
     Column, Segment, Special, SPECIAL_64, SPECIAL_65, Undecoded, Value
+    ColumnType, CurveRecord, CurveJoinProblem
 """
 
 from .opju import (
@@ -15,6 +16,9 @@ from .opju import (
     AssetDirectory,
     AssetEntry,
     Column,
+    ColumnType,
+    CurveJoinProblem,
+    CurveRecord,
     Document,
     GlobalHeader,
     Header,
@@ -37,6 +41,9 @@ __all__ = [
     "AssetDirectory",
     "AssetEntry",
     "Column",
+    "ColumnType",
+    "CurveJoinProblem",
+    "CurveRecord",
     "Document",
     "GlobalHeader",
     "Header",

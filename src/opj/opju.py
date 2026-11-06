@@ -19,8 +19,8 @@ import re
 import struct
 import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from enum import StrEnum
+from dataclasses import dataclass, field, replace
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,21 @@ COLUMN_RECORD_FRAME = 0x80
 #: A column record's expanded size, and where its NUL-padded name sits.
 COLUMN_RECORD_SIZE = 147
 COLUMN_NAME_OFFSET = 0x58
+#: Fields of the expanded column record: u32 rows, and the stored value size.
+COLUMN_TOTAL_ROWS_OFFSET = 0x19
+COLUMN_FIRST_ROW_OFFSET = 0x1D
+COLUMN_LAST_ROW_OFFSET = 0x21
+COLUMN_VALUE_SIZE_OFFSET = 0x3D
+#: A curve record's expanded size, and its size at format version 4.33xx.
+CURVE_RECORD_SIZE = 519
+CURVE_RECORD_SIZE_4_33 = 515
+#: Where a curve record holds its type byte and NUL-terminated short name.
+CURVE_TYPE_OFFSET = 0x11
+CURVE_NAME_OFFSET = 0x12
+#: The most filler bytes seen between a curve record and its label.
+LABEL_FILLER_MAX = 3
+#: The label's line separator: long name, units, comment.
+LABEL_LINE_SEPARATOR = b"\r\n"
 #: The last two bytes of a column payload.
 COLUMN_PAYLOAD_END = b"\xce\xfa"
 #: Payload kinds.
@@ -204,9 +219,56 @@ class StringSection:
     undecoded: str | None = None
 
 
+class ColumnType(Enum):
+    """A curve record's type byte. Other bytes keep their value as an unknown."""
+
+    Y = 0
+    Y_ERROR = 2
+    X = 3
+    LABEL = 4
+    Z = 5
+    X_ERROR = 6
+
+    @classmethod
+    def _missing_(cls, value: object) -> ColumnType | None:
+        if not isinstance(value, int):
+            return None
+        member = object.__new__(cls)
+        member._name_ = f"UNKNOWN_{value}"
+        member._value_ = value
+        return cls._value2member_map_.setdefault(value, member)  # type: ignore[return-value]
+
+    @property
+    def known(self) -> bool:
+        return self.name in type(self).__members__
+
+
+class CurveJoinProblem(StrEnum):
+    """Why a column has no type or label."""
+
+    NO_COLUMN_NAME = "column has no name of the form <book>_<col>"
+    NO_RECORD = "no curve record of this name in the column's book"
+    FEWER_RECORDS = "the book has fewer records of this name than the sheet index"
+
+
+@dataclass(frozen=True)
+class CurveRecord:
+    """A curve record: a column's short name, its type, and any label after it."""
+
+    offset: int
+    size: int
+    name: str | bytes
+    column_type: ColumnType
+    #: Raw label markup and any stray control bytes are kept as found.
+    long_name: str | bytes | None = None
+    units: str | bytes | None = None
+    comment: str | bytes | None = None
+    label_offset: int | None = None
+
+
 @dataclass(frozen=True)
 class Column:
-    """One column: its coded record, descriptor, and decoded payload."""
+    """One column: its coded record, descriptor, decoded payload, and metadata."""
 
     offset: int  # file offset of the descriptor's ``18``
     payload_offset: int
@@ -230,6 +292,22 @@ class Column:
     unresolved_rows: int = 0
     resolution_problem: str | None = None
     undecoded: Undecoded | None = None
+    #: Fields of the expanded record; ``None`` without a record.
+    total_rows: int | None = None
+    first_row: int | None = None
+    last_row: int | None = None
+    value_size: int | None = None
+    #: From the joined curve record. The sheet rule (``<col>@k`` is the k-th record
+    #: in the book) is a hypothesis. A joined record may have no label.
+    column_type: ColumnType | None = None
+    long_name: str | bytes | None = None
+    units: str | bytes | None = None
+    comment: str | bytes | None = None
+    #: The joined record's offset, how many records of this name the book has, and
+    #: why all four fields above are ``None`` when the join failed.
+    curve_offset: int | None = None
+    curves_in_book: int = 0
+    curve_problem: CurveJoinProblem | None = None
 
 
 @dataclass
@@ -248,6 +326,8 @@ class Document:
     string_sections: list[StringSection] = field(default_factory=list)
     #: Column payloads in file order.
     columns: list[Column] = field(default_factory=list)
+    #: Curve records past the last column payload, in file order.
+    curve_records: list[CurveRecord] = field(default_factory=list)
     #: The settings document's raw UTF-8 bytes. Its values can hold local paths and
     #: usernames from other machines: do not log or copy them.
     settings_xml: bytes | None = None
@@ -640,8 +720,20 @@ def _record_fields(data: bytes, descriptor: int, start: int) -> dict[str, Any]:
         record = expand(data, frame + 2, descriptor)
         if len(record) != COLUMN_RECORD_SIZE:
             continue
-        return {"record_offset": frame, "record": record, **_record_name(record)}
+        return {
+            "record_offset": frame,
+            "record": record,
+            "total_rows": _u32(record, COLUMN_TOTAL_ROWS_OFFSET),
+            "first_row": _u32(record, COLUMN_FIRST_ROW_OFFSET),
+            "last_row": _u32(record, COLUMN_LAST_ROW_OFFSET),
+            "value_size": record[COLUMN_VALUE_SIZE_OFFSET],
+            **_record_name(record),
+        }
     return {"record_problem": f"no frame expands to {COLUMN_RECORD_SIZE} bytes"}
+
+
+def _u32(record: bytes, offset: int) -> int:
+    return int.from_bytes(record[offset : offset + 4], "little")
 
 
 def _record_name(record: bytes) -> dict[str, Any]:
@@ -685,6 +777,173 @@ def parse_columns(
             )
         )
     return columns
+
+
+# --- curve records and the join to columns -----------------------------------
+
+
+def _label_at(data: bytes, pos: int) -> bytes | None:
+    """The label text if ``pos`` holds ``<s> <s-1> <s-1 bytes ending in NUL>``."""
+    if pos + 1 >= len(data):
+        return None
+    size = data[pos]
+    if size < 2 or data[pos + 1] != size - 1 or pos + size >= len(data):
+        return None
+    if data[pos + size] != 0:
+        return None
+    return data[pos + 2 : pos + size]
+
+
+def _find_label(data: bytes, pos: int, frames: set[int]) -> tuple[int, bytes] | None:
+    """Pass a few filler bytes after a frame until a label, a frame, or anything else.
+
+    The label is tried first at each step, because its ``<s>`` can equal a filler
+    byte.
+    """
+    limit = pos + LABEL_FILLER_MAX
+    while pos not in frames and pos < len(data) and pos <= limit:
+        label = _label_at(data, pos)
+        if label is not None:
+            return pos, label
+        if data[pos : pos + 2] == b"\x01\x00":
+            pos += 2
+        elif data[pos] in (0x00, 0x0A):
+            pos += 1
+        else:
+            return None
+    return None
+
+
+def _curve_frames(data: bytes, start: int, size: int) -> list[tuple[int, int, bytes]]:
+    """Find ``80 <n>`` frames expanding to ``size``: offset, end, expanded bytes."""
+    found: list[tuple[int, int, bytes]] = []
+    pos = data.find(COLUMN_RECORD_FRAME, start)
+    while 0 <= pos < len(data) - 1:
+        end = pos + 2 + data[pos + 1]
+        if end <= len(data) and _ends_in_zero_run(data, pos + 2, end):
+            record = expand(data, pos + 2, end)
+            if len(record) == size:
+                found.append((pos, end, record))
+                pos = data.find(COLUMN_RECORD_FRAME, end)
+                continue
+        pos = data.find(COLUMN_RECORD_FRAME, pos + 1)
+    return found
+
+
+def parse_curve_records(
+    data: bytes, start: int, format_version: str
+) -> list[CurveRecord]:
+    """Parse the curve records at or after ``start``, with their labels."""
+    size = (
+        CURVE_RECORD_SIZE_4_33
+        if format_version.startswith("4.33")
+        else (CURVE_RECORD_SIZE)
+    )
+    frames = _curve_frames(data, start, size)
+    starts = {offset for offset, _, _ in frames}
+    records = []
+    for offset, end, expanded in frames:
+        name = expanded[CURVE_NAME_OFFSET:].split(b"\x00", 1)[0]
+        labels: dict[str, Any] = {}
+        found = _find_label(data, end, starts)
+        if found is not None:
+            labels["label_offset"] = found[0]
+            lines = found[1].split(LABEL_LINE_SEPARATOR, 2)
+            for key, line in zip(
+                ("long_name", "units", "comment"), lines, strict=False
+            ):
+                labels[key] = _text(line)
+        records.append(
+            CurveRecord(
+                offset,
+                size,
+                _text(name),
+                ColumnType(expanded[CURVE_TYPE_OFFSET]),
+                **labels,
+            )
+        )
+    return records
+
+
+def _split_column_name(name: str) -> tuple[str, str, int] | None:
+    """Split ``<book>_<col>[@k]`` into book, short name and sheet index."""
+    book, separator, col = name.rpartition("_")
+    if not separator or not book or not col:
+        return None
+    short, at, sheet = col.rpartition("@")
+    if at and short and sheet.isdecimal() and int(sheet) >= 1:
+        return book, short, int(sheet)
+    return book, col, 1
+
+
+def _book_starts(data: bytes, books: set[str], start: int) -> list[tuple[int, str]]:
+    """Where each book's name occurs as a literal: followed by NUL or a zero run."""
+    occurrences = []
+    for book in books:
+        pattern = re.escape(book.encode()) + rb"(?=[\x00\x80-\xbf])"
+        occurrences += [
+            (match.start(), book) for match in re.finditer(pattern, data[start:])
+        ]
+    return sorted((offset + start, book) for offset, book in occurrences)
+
+
+def join_curve_records(
+    data: bytes, columns: list[Column], curves: list[CurveRecord], start: int
+) -> list[Column]:
+    """Give columns their type and label from their book's curve records.
+
+    A curve record belongs to the book whose name occurs last before it, among
+    the books that columns name. ``<col>@k`` is the k-th record of ``<col>`` in its
+    book, which is a hypothesis. Other columns get a problem, not a guess.
+    """
+    names = {c.name: _split_column_name(c.name) for c in columns if c.name is not None}
+    books = {split[0] for split in names.values() if split is not None}
+    occurrences = _book_starts(data, books, start)
+
+    by_book: dict[tuple[str, str | bytes], list[CurveRecord]] = {}
+    index = 0
+    current = None
+    for curve in curves:
+        while index < len(occurrences) and occurrences[index][0] < curve.offset:
+            current = occurrences[index][1]
+            index += 1
+        if current is not None:
+            by_book.setdefault((current, curve.name), []).append(curve)
+
+    joined = []
+    for column in columns:
+        split = names.get(column.name) if column.name is not None else None
+        if split is None:
+            joined.append(
+                replace(column, curve_problem=CurveJoinProblem.NO_COLUMN_NAME)
+            )
+            continue
+        book, short, sheet = split
+        records = by_book.get((book, short), [])
+        if not records:
+            joined.append(replace(column, curve_problem=CurveJoinProblem.NO_RECORD))
+        elif sheet > len(records):
+            joined.append(
+                replace(
+                    column,
+                    curves_in_book=len(records),
+                    curve_problem=CurveJoinProblem.FEWER_RECORDS,
+                )
+            )
+        else:
+            record = records[sheet - 1]
+            joined.append(
+                replace(
+                    column,
+                    curves_in_book=len(records),
+                    curve_offset=record.offset,
+                    column_type=record.column_type,
+                    long_name=record.long_name,
+                    units=record.units,
+                    comment=record.comment,
+                )
+            )
+    return joined
 
 
 # --- string sections --------------------------------------------------------
@@ -791,6 +1050,12 @@ def parse(data: bytes) -> Document:
     root = root_header(data, header)
     stream_start = header.body_offset + ROOT_HEADER_LEN
     sections = parse_string_sections(data, stream_start)
+    columns = parse_columns(data, stream_start, sections)
+    past_payloads = stream_start
+    if columns:
+        past_payloads = columns[-1].payload_offset + columns[-1].payload_length
+    curves = parse_curve_records(data, past_payloads, header.format_version)
+    columns = join_curve_records(data, columns, curves, past_payloads)
     return Document(
         header=header,
         root_header=root,
@@ -798,7 +1063,8 @@ def parse(data: bytes) -> Document:
         global_header=parse_global_header(data),
         asset_directory=parse_asset_directory(data),
         string_sections=sections,
-        columns=parse_columns(data, stream_start, sections),
+        columns=columns,
+        curve_records=curves,
         settings_xml=parse_settings_xml(data, stream_start),
     )
 

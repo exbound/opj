@@ -14,7 +14,17 @@ from pathlib import Path
 import pytest
 
 from fpc_encoder import encode
-from opj import SPECIAL_64, SPECIAL_65, Column, Special, Undecoded, parse, read
+from opj import (
+    SPECIAL_64,
+    SPECIAL_65,
+    Column,
+    ColumnType,
+    CurveJoinProblem,
+    Special,
+    Undecoded,
+    parse,
+    read,
+)
 from opj.__main__ import main
 
 _FILE_HEAD = b"CPYUA 4.3330 172\n" + bytes((0x3E, 0x01, 0x6C, 0xC0, 0x11, 0x01, 0x02))
@@ -36,8 +46,9 @@ def _zero_tokens(count: int) -> bytes:
     """Zero-run tokens for ``count`` zeros, in pieces of at least 3."""
     out = bytearray()
     while count > 66:
-        out.append(0xBF)
-        count -= 66
+        piece = min(66, count - 3)
+        out.append(0x80 | (piece - 3))
+        count -= piece
     if count:
         out.append(0x80 | (count - 3))
     return bytes(out)
@@ -868,6 +879,321 @@ def test_directory_absent_without_preview_field() -> None:
     assert parse(_FILE_HEAD).asset_directory is None
 
 
+# --- record fields ----------------------------------------------------------
+
+
+def _record_with_fields(
+    name: bytes, total: int, first: int, last: int, value_size: int
+) -> bytes:
+    body = bytearray(147 - 20)
+    struct.pack_into("<III", body, 0x19, total, first, last)
+    body[0x3D] = value_size
+    body[0x58 : 0x58 + len(name)] = name
+    coded = b"\x7f" + bytes(body) + _zero_tokens(20)
+    return bytes((0x80, len(coded))) + coded
+
+
+def test_record_fields_are_read_from_the_expanded_record() -> None:
+    payload = _doubles([1.0, 2.0])
+    record = _record_with_fields(b"Book1_A", 2, 5, 9, 24)
+    [column] = parse(_FILE_HEAD + record + _descriptor(len(payload)) + payload).columns
+    assert column.total_rows == 2
+    assert column.first_row == 5
+    assert column.last_row == 9
+    assert column.value_size == 24
+    assert column.name == "Book1_A"
+
+
+def test_record_fields_are_none_without_a_record() -> None:
+    payload = _doubles([1.0])
+    data = _FILE_HEAD + _zero_tokens(20) + _descriptor(len(payload)) + payload
+    [column] = parse(data).columns
+    fields = (column.total_rows, column.first_row, column.last_row, column.value_size)
+    assert fields == (None, None, None, None)
+
+
+# --- curve records, labels and the join ---------------------------------------
+
+_HEAD_519 = b"CPYUA 4.3721 180\n" + bytes((0x3E, 0x01, 0x6C, 0xC0, 0x11, 0x01, 0x02))
+_X = 3
+
+
+def _curve(name: bytes = b"A", type_byte: int = _X, size: int = 519) -> bytes:
+    coded = (
+        _zero_tokens(0x11)
+        + bytes((1 + len(name), type_byte))
+        + name
+        + _zero_tokens(size - 0x12 - len(name))
+    )
+    return bytes((0x80, len(coded))) + coded
+
+
+def _label(text: bytes) -> bytes:
+    size = len(text) + 2
+    return bytes((size, size - 1)) + text + b"\x00"
+
+
+def _labelled_column(after_curve: bytes, name: bytes = b"Book1_A") -> Column:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), name)
+        + b"Book1\x00"
+        + _curve()
+        + after_curve
+    )
+    return parse(data).columns[0]
+
+
+@pytest.mark.parametrize(
+    "byte, member",
+    [
+        (3, ColumnType.X),
+        (0, ColumnType.Y),
+        (5, ColumnType.Z),
+        (6, ColumnType.X_ERROR),
+        (2, ColumnType.Y_ERROR),
+        (4, ColumnType.LABEL),
+    ],
+)
+def test_type_byte_is_read_at_0x11(byte: int, member: ColumnType) -> None:
+    data = _HEAD_519 + _column(_doubles([1.0])) + b"Book1\x00" + _curve(type_byte=byte)
+    assert parse(data).columns[0].column_type is member
+    assert member.known
+
+
+@pytest.mark.parametrize("byte", [1, 9, 255])
+def test_unknown_type_keeps_the_raw_byte(byte: int) -> None:
+    data = _HEAD_519 + _column(_doubles([1.0])) + b"Book1\x00" + _curve(type_byte=byte)
+    column_type = parse(data).columns[0].column_type
+    assert column_type is not None
+    assert column_type.value == byte
+    assert not column_type.known
+    assert column_type is ColumnType(byte)
+
+
+def test_label_lines_are_long_name_units_comment() -> None:
+    column = _labelled_column(b"\x00" + _label(b"BE\r\neV\r\nscan"))
+    assert (column.long_name, column.units, column.comment) == ("BE", "eV", "scan")
+    assert column.column_type is ColumnType.X
+    assert column.curve_problem is None
+
+
+def test_label_with_only_a_long_name() -> None:
+    column = _labelled_column(b"\x00" + _label(b"Raw"))
+    assert (column.long_name, column.units, column.comment) == ("Raw", None, None)
+
+
+def test_label_with_empty_long_name_keeps_it_empty() -> None:
+    column = _labelled_column(b"\x00" + _label(b"\r\nkeV"))
+    assert (column.long_name, column.units) == ("", "keV")
+
+
+def test_comment_keeps_further_line_separators() -> None:
+    column = _labelled_column(b"\x00" + _label(b"a\r\nb\r\nc\r\nd"))
+    assert column.comment == "c\r\nd"
+
+
+@pytest.mark.parametrize(
+    "filler",
+    [
+        pytest.param(b"", id="none"),
+        pytest.param(b"\x00", id="00"),
+        pytest.param(b"\x01\x00", id="01-00"),
+        pytest.param(b"\x0a", id="0a"),
+        pytest.param(b"\x01\x00\x0a", id="01-00-0a"),
+    ],
+)
+def test_each_filler_before_a_label(filler: bytes) -> None:
+    assert _labelled_column(filler + _label(b"Raw")).long_name == "Raw"
+
+
+def test_label_size_equal_to_a_filler_byte_is_not_taken_as_filler() -> None:
+    # <s> of 0A, the same byte as the filler, with an 8-byte text.
+    label = _label(b"12345678")
+    assert label[0] == 0x0A
+    assert _labelled_column(b"\x01\x00\x0a" + label).long_name == "12345678"
+
+
+def test_label_second_byte_must_be_size_minus_one() -> None:
+    column = _labelled_column(b"\x00\x05\x05abc\x00")
+    assert column.long_name is None
+    assert column.column_type is ColumnType.X
+
+
+def test_label_must_end_in_nul() -> None:
+    assert _labelled_column(b"\x00\x05\x04abcd\x00").long_name is None
+
+
+def test_no_label_before_the_next_frame() -> None:
+    column = _labelled_column(_curve(b"B") + _label(b"belongs to B"))
+    assert column.long_name is None
+    assert column.column_type is ColumnType.X
+    assert column.curve_problem is None
+
+
+def test_no_label_before_other_bytes() -> None:
+    assert _labelled_column(b"\x00\xc7\x41").long_name is None
+
+
+def test_no_label_past_a_few_filler_bytes() -> None:
+    assert _labelled_column(b"\x00" * 3 + _label(b"Raw")).long_name == "Raw"
+    assert _labelled_column(b"\x00" * 4 + _label(b"Raw")).long_name is None
+
+
+def test_label_markup_is_returned_raw() -> None:
+    assert _labelled_column(_label(rb"2\g(q)")).long_name == r"2\g(q)"
+
+
+def test_label_control_bytes_stay_as_found() -> None:
+    column = _labelled_column(_label(b"a\x01b\x7f\rc\nd"))
+    assert column.long_name == "a\x01b\x7f\rc\nd"
+    assert column.units is None
+
+
+def test_label_non_utf8_stays_bytes() -> None:
+    assert _labelled_column(_label(b"caf\xe9")).long_name == b"caf\xe9"
+
+
+def test_curve_size_follows_the_format_version() -> None:
+    columns = _column(_doubles([1.0]))
+    at_519 = b"Book1\x00" + _curve(size=519)
+    at_515 = b"Book1\x00" + _curve(size=515)
+    assert parse(_HEAD_519 + columns + at_519).columns[0].column_type is ColumnType.X
+    assert parse(_HEAD_519 + columns + at_515).columns[0].column_type is None
+    assert parse(_FILE_HEAD + columns + at_515).columns[0].column_type is ColumnType.X
+    assert parse(_FILE_HEAD + columns + at_519).columns[0].column_type is None
+
+
+def _assert_join_failed(column: Column, problem: CurveJoinProblem) -> None:
+    assert column.curve_problem is problem
+    assert column.column_type is None
+    assert column.long_name is None
+    assert column.units is None
+    assert column.comment is None
+    assert column.curve_offset is None
+
+
+def test_join_book_literal_followed_by_a_zero_run_token() -> None:
+    data = _HEAD_519 + _column(_doubles([1.0])) + b"Book1" + _curve()
+    assert parse(data).columns[0].column_type is ColumnType.X
+
+
+def test_join_book_literal_followed_by_anything_else_is_not_an_occurrence() -> None:
+    data = _HEAD_519 + _column(_doubles([1.0])) + b"Book1]" + _curve()
+    _assert_join_failed(parse(data).columns[0], CurveJoinProblem.NO_RECORD)
+
+
+def test_join_ignores_book_literals_before_the_last_payload() -> None:
+    data = _HEAD_519 + b"Book1\x00" + _curve() + _column(_doubles([1.0])) + _curve()
+    _assert_join_failed(parse(data).columns[0], CurveJoinProblem.NO_RECORD)
+
+
+def test_join_uses_the_columns_own_book() -> None:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), b"Book1_A")
+        + _column(_doubles([2.0]), b"Book2_A")
+        + b"Book1\x00"
+        + _curve(type_byte=3)
+        + _label(b"first book")
+        + b"Book2\x00"
+        + _curve(type_byte=0)
+        + _label(b"second book")
+    )
+    first, second = parse(data).columns
+    assert (first.column_type, first.long_name) == (ColumnType.X, "first book")
+    assert (second.column_type, second.long_name) == (ColumnType.Y, "second book")
+    assert (first.curves_in_book, second.curves_in_book) == (1, 1)
+
+
+def test_join_order_of_books_in_the_stream_is_followed() -> None:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), b"Book1_A")
+        + _column(_doubles([2.0]), b"Book2_A")
+        + b"Book2\x00"
+        + _curve(type_byte=0)
+        + b"Book1\x00"
+        + _curve(type_byte=3)
+    )
+    first, second = parse(data).columns
+    assert (first.column_type, second.column_type) == (ColumnType.X, ColumnType.Y)
+
+
+def test_join_prefix_of_a_longer_book_name_is_not_an_occurrence() -> None:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), b"Book1_A")
+        + b"Book1\x00"
+        + _curve(type_byte=3)
+        + b"Book11\x00"
+        + _curve(type_byte=0)
+    )
+    column = parse(data).columns[0]
+    assert column.curves_in_book == 2
+    assert column.column_type is ColumnType.X
+
+
+def _two_sheets(column_name: bytes) -> Column:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), column_name)
+        + b"Book1\x00"
+        + _curve(type_byte=3)
+        + _label(b"sheet one")
+        + _curve(type_byte=0)
+        + _label(b"sheet two")
+    )
+    return parse(data).columns[0]
+
+
+def test_join_plain_name_is_the_first_record_in_the_book() -> None:
+    column = _two_sheets(b"Book1_A")
+    assert (column.long_name, column.curves_in_book) == ("sheet one", 2)
+
+
+def test_join_at_k_is_the_kth_record_in_the_book() -> None:
+    column = _two_sheets(b"Book1_A@2")
+    assert column.long_name == "sheet two"
+    assert column.column_type is ColumnType.Y
+    assert column.curves_in_book == 2
+
+
+def test_join_fails_when_the_book_has_fewer_records_than_the_sheet() -> None:
+    column = _two_sheets(b"Book1_A@3")
+    _assert_join_failed(column, CurveJoinProblem.FEWER_RECORDS)
+    assert column.curves_in_book == 2
+
+
+def test_join_fails_when_no_record_has_the_name() -> None:
+    column = _two_sheets(b"Book1_Z")
+    _assert_join_failed(column, CurveJoinProblem.NO_RECORD)
+    assert column.curves_in_book == 0
+
+
+def test_join_fails_for_a_name_without_a_book() -> None:
+    column = _labelled_column(_label(b"Raw"), name=b"NoSeparator")
+    _assert_join_failed(column, CurveJoinProblem.NO_COLUMN_NAME)
+
+
+def test_join_fails_for_a_column_without_a_name() -> None:
+    payload = _doubles([1.0])
+    data = (
+        _HEAD_519
+        + _zero_tokens(20)
+        + _descriptor(len(payload))
+        + payload
+        + b"Book1\x00"
+        + _curve()
+    )
+    _assert_join_failed(parse(data).columns[0], CurveJoinProblem.NO_COLUMN_NAME)
+
+
+@pytest.mark.parametrize("name", [b"Book1_A@x", b"Book1_A@0", b"Book1_A@"])
+def test_join_at_without_a_sheet_number_is_part_of_the_name(name: bytes) -> None:
+    _assert_join_failed(_two_sheets(name), CurveJoinProblem.NO_RECORD)
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -909,6 +1235,25 @@ def test_cli_prints_strings_and_problems(
     data = _FILE_HEAD + _column(_integers([1, 2]))
     lines = _cli_lines(tmp_path, capsys, data + _section([b"Albania"]))
     assert any("values: 'Albania', 2" in ln and "unresolved" in ln for ln in lines)
+
+
+def test_cli_prints_type_long_name_and_units(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = (
+        _HEAD_519
+        + _column(_doubles([1.0]), b"Book1_A")
+        + _column(_doubles([2.0]), b"Book1_B")
+        + b"Book1\x00"
+        + _curve(b"A")
+        + _label(b"BE\r\neV")
+    )
+    lines = _cli_lines(tmp_path, capsys, data)
+    assert any("Book1_A type=X long='BE' units='eV' rows=1" in ln for ln in lines)
+    assert any(
+        "Book1_B" in ln and f"(no type: {CurveJoinProblem.NO_RECORD})" in ln
+        for ln in lines
+    )
 
 
 def test_cli_reports_undecoded_column(
@@ -1001,6 +1346,16 @@ def test_periodictable_integer_column_is_element_symbols(periodic_table: Path) -
         "Ne",
     )
     assert symbols.resolution_problem is None
+
+
+def test_xpsarea_columns_have_type_and_labels(xps_area: Path) -> None:
+    columns = {c.name: c for c in read(xps_area).columns}
+    energy = columns["Book1_A"]
+    assert energy.column_type is ColumnType.X
+    assert (energy.long_name, energy.units) == ("BE", "eV")
+    raw = columns["Book1_B"]
+    assert raw.column_type is ColumnType.Y
+    assert raw.long_name == "Raw"
 
 
 def test_xpsarea_first_column_is_a_fixed_step_scan(xps_area: Path) -> None:

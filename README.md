@@ -15,8 +15,9 @@ the C1–C9 capability model and the Origin dossier.
 ## Status
 
 Early. The reader parses the container header and the global header's version
-and build; expands the run-length layer; reads column records for their names;
-decodes column payloads to all their rows (doubles, strings, and integers resolved
+and build; expands the run-length layer; reads column records for their names and
+row fields; joins columns to curve records for their type and labels; decodes
+column payloads to all their rows (doubles, strings, and integers resolved
 through LZ4-compressed string sections); delimits assets through the 16-byte asset
 directory; and exposes the stored settings document as raw bytes. Compact-double
 codes whose meaning is not established stay as distinct markers, and an
@@ -39,6 +40,9 @@ checks, as noted.
 | C2 run-length layer | partial (column records, settings document) | yes | no | corpus figures |
 | C2 column names (expanded record) | yes (903 records) | yes | no | corpus figures |
 | C2 column values: doubles, strings, integers | yes (903 payloads) | yes | no | corpus figures, public-fact checks |
+| C2 column record fields: total, first and last row, value size | yes (903 records; first and last row differ from the data in 1 and 25 of 891) | yes, raw | no | corpus figures |
+| C2 column type and labels, joined through curve records | yes (807 of 903 columns reach a record by the rule) | yes, with a hypothesized sheet rule; the other 96 are left empty with the reason | no | corpus figures, public-fact check |
+| C2 type value 1, label markup, stray control bytes in labels | yes | no: returned raw | no | |
 | C2 compact-double codes `64`, `65` | yes (1892 rows) | no: kept as markers | no | |
 | C2 integer resolution through string sections | yes (48 sections) | yes, by a hypothesized rule | no | corpus figures, public-fact check |
 | C2 settings document | yes (98 files) | raw bytes only | no | corpus figures |
@@ -68,7 +72,8 @@ python -m opj path/to/project.opju
 The CLI prints the header fields, the build and version, an asset-directory
 summary, the root header, the settings document's size and number of direct
 children, counts of string sections and text candidates, and each column's name,
-row count and first few values, with any parse or resolution problem.
+type, long name, units, row count and first few values, with any parse, resolution
+or join problem.
 
 ## Build and test
 

@@ -20,9 +20,12 @@ from opj import (
     SPECIAL_65,
     AssetDirectory,
     Column,
+    CurveJoinProblem,
     Document,
     RunLengthError,
+    Special,
     StringSection,
+    Value,
     parse,
 )
 from opj.opju import SETTINGS_ROOT, STRING_HEADER, iter_expanded
@@ -76,6 +79,37 @@ def _count_values(column: Column, counts: Counter[str]) -> None:
             counts["rows_other"] += 1
 
 
+def _is_filled(value: Value) -> bool:
+    """Filled excludes empty rows and the special codes."""
+    if value is None or isinstance(value, Special):
+        return False
+    return not isinstance(value, str | bytes) or len(value) > 0
+
+
+def _count_record_fields(column: Column, counts: Counter[str]) -> None:
+    counts["total_rows_is_row_count"] += column.total_rows == len(column.values)
+    counts["value_size_10"] += column.value_size == 10
+    filled = [i for i, value in enumerate(column.values) if _is_filled(value)]
+    if filled:
+        counts["columns_with_data"] += 1
+        counts["first_row_is_first_filled"] += column.first_row == filled[0]
+        counts["last_row_is_last_filled"] += column.last_row == filled[-1] + 1
+
+
+def _count_join(column: Column, counts: Counter[str]) -> None:
+    counts["columns_reaching_a_record"] += column.curves_in_book > 0
+    counts["reached_record_unique_in_book"] += column.curves_in_book == 1
+    counts["fewer_records_than_sheet"] += (
+        column.curve_problem is CurveJoinProblem.FEWER_RECORDS
+    )
+    failed = column.curve_problem is CurveJoinProblem.NO_RECORD
+    counts["no_record"] += failed
+    counts["no_record_at_3"] += failed and (column.name or "").endswith("@3")
+    if column.column_type is not None:
+        counts["typed"] += 1
+        counts[f"type_{column.column_type.name}"] += 1
+
+
 def _count_column(data: bytes, column: Column, counts: Counter[str]) -> None:
     counts["ce_fa_ended"] += 1
     counts["undecoded"] += column.undecoded is not None
@@ -99,6 +133,8 @@ def _count_column(data: bytes, column: Column, counts: Counter[str]) -> None:
         and data[column.offset - n - 1] == n
     )
     counts["columns_with_several_frames"] += frames > 1
+    _count_record_fields(column, counts)
+    _count_join(column, counts)
 
     for segment in column.segments:
         if segment.selector:
@@ -203,6 +239,12 @@ def _measure(corpus: Path) -> Counter[str]:
             counts["build_matches"] += doc.header.build == doc.global_header.build
             versions.append(doc.global_header.version)
         _count_directory(data, doc.asset_directory, counts)
+        sizes = {curve.size for curve in doc.curve_records}
+        counts["curve_size_519_files"] += sizes == {519}
+        counts["curve_size_515_files"] += sizes == {515}
+        counts["curve_size_515_at_4_33"] += sizes == {
+            515
+        } and doc.header.format_version.startswith("4.33")
         for section in doc.string_sections:
             _count_section(section, counts)
         for column in doc.columns:
@@ -249,6 +291,11 @@ def measured() -> Counter[str]:
         ("record_147", 903),
         ("name_at_0x58", 903),
         ("columns_with_several_frames", 6),
+        ("total_rows_is_row_count", 903),
+        ("columns_with_data", 891),
+        ("first_row_is_first_filled", 890),
+        ("last_row_is_last_filled", 866),
+        ("value_size_10", 882),
         # §2.6 grammar
         ("undecoded", 0),
         ("rows_equal_a", 903),
@@ -281,6 +328,22 @@ def measured() -> Counter[str]:
         ("settings_origin_storage_root", 98),
         ("settings_tool_names", 225),
         ("settings_is_first_document", 98),
+        # §2.9. The file counts are not in the specification: they pin which sizes
+        # it states to which files.
+        ("curve_size_519_files", 97),
+        ("curve_size_515_files", 1),
+        ("curve_size_515_at_4_33", 1),
+        ("columns_reaching_a_record", 885),
+        ("reached_record_unique_in_book", 618),
+        ("fewer_records_than_sheet", 78),
+        ("no_record", 18),
+        ("no_record_at_3", 12),
+        ("typed", 807),
+        ("type_Y", 632),
+        ("type_X", 139),
+        ("type_Z", 16),
+        ("type_Y_ERROR", 12),
+        ("type_UNKNOWN_1", 8),
     ],
 )
 def test_spec_figure(measured: Counter[str], figure: str, expected: int) -> None:

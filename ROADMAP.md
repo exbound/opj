@@ -36,8 +36,9 @@ samples with the coverage triplet (reference observed / implemented / verified).
    This also settles the special value codes and flag meanings.
 2. **Whole-stream walk.** Expand the run-length layer end to end and catalog the
    record types.
-3. **Legacy field mapping.** Compare expanded column records with the open `.opj`
-   header knowledge (type, width, long name, units, …).
+3. **Legacy field mapping.** Column type, long name, units and comment are read
+   for single-sheet columns (spec §2.9). Finish multi-sheet books and the remaining
+   header fields against the open `.opj` knowledge.
 4. **Object tree.** Recover nesting and boundaries (folders → books → sheets →
    columns; windows/graphs).
 5. **Matrices.** Determine whether 2-D data shares the column payload form.

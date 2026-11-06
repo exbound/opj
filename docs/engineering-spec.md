@@ -148,8 +148,18 @@ The `n` coded bytes end in a zero-run token. Expanded through §2.1, the record 
 <n>` can also occur by coincidence inside the coded bytes, so more than one frame
 can end at a descriptor (6 of 903): take the nearest one that expands to 147 bytes.
 `0x58` is also where the open `liborigin` reader documents the name in the legacy
-`.opj` dataset header, so **[H]** the legacy header layout largely carries over.
-**[N]** the other fields.
+`.opj` dataset header, and more of that layout carries over:
+
+| Offset | Field | Evidence |
+|---|---|---|
+| `0x19` | u32 total rows | equals the decoded row count, 903 of 903 |
+| `0x1D` | u32 first row | equals the first filled row, 890 of 891 columns with data |
+| `0x21` | u32 last row | equals the last filled row + 1, 866 of 891 |
+| `0x25`, `0x2D` | f64 | 1.0 in all 903 **[N]** meaning |
+| `0x3D` | u8 stored value size | 10 in 882 of 903; larger only on text columns |
+
+"Filled" excludes empty rows and the special codes of §2.6. **[N]** the 25 and 1
+exceptions, and the other fields.
 
 An earlier version of this document read a "new-object" tag such as `0x97` against
 a "continuation" tag `0x82`. Those are zero-run lengths before the name, so they
@@ -278,6 +288,37 @@ whether they describe the project's data, and where a real operation tree lives.
 
 Values in this document can hold local file paths and usernames from other
 machines. Do not copy them into tests, fixtures or documentation.
+
+### 2.9 Column type and labels **[E]** / **[H]** / **[N]**
+
+Later in the stream, each worksheet has a window record and curve records for its
+columns. These are framed `80 <n> <n coded bytes>` like column records:
+
+- A curve record expands to 519 bytes, or to 515 at format version 4.33xx.
+- The short column name is NUL-terminated at offset `0x12`.
+- The byte at `0x11` is the column type: 3 X, 0 Y, 5 Z, 6 X error, 2 Y error, 4
+  label. This matches the open `liborigin` reader. Value 1 also occurs **[N]**.
+
+After the frame come up to 3 filler bytes (seen before a label: `00`, `01 00`,
+`01 00 0A`), then the label, if any: `<s> <s-1> <s-1 bytes ending in NUL>`, whose
+text is the long name, units and comment on lines separated by CR LF, such as
+`BE`, `eV`. `<s>` can equal a filler byte, so try the label form first at each
+position. Otherwise another frame follows. Label text can hold Origin markup:
+`2\g(q)`, `\+(o)`.
+
+**Joining to a column [E] / [H].** Past the last column payload, a curve record
+belongs to whichever book name occurs last before it, among the book names the
+file's columns carry, as a literal followed by a NUL or a zero-run token. A column
+named `<book>_<col>` then takes a record named `<col>` in its book. **[N]** A record
+in a book with no columns would be attributed to the previous book. Measured: 885
+of 903 columns reach a record in their book, 618 of them unique within it. Types
+then read 632 Y, 139 X, 16 Z, 12 Y error, 8 of value 1.
+
+**[H]** Repeated records in a book belong to its sheets in order (`<col>@2` is the
+second). This fails where a book has fewer records than the sheet index (78), and
+18 columns reach no record (at least 12 of them `@3`). **[N]** multi-sheet
+structure. A reader must leave these columns without a type or label rather than
+guess. Some parsed labels hold stray control bytes **[N]**.
 
 ## 3. Compatibility oracle
 

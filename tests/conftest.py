@@ -43,3 +43,13 @@ def sample_data() -> Path:
 @pytest.fixture
 def fit_summation() -> Path:
     return require("FitSummation.opju")
+
+
+@pytest.fixture
+def periodic_table() -> Path:
+    return require("PeriodicTable.opju")
+
+
+@pytest.fixture
+def xps_area() -> Path:
+    return require("XPSArea.opju")

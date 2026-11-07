@@ -2,10 +2,9 @@
 
 `opj` reconstructs the Origin project-file format one independently verifiable
 layer at a time. The format is deep — a document is a tree of objects
-(folders, workbooks/worksheets, matrices, graphs, notes) whose records mix
-fixed-layout binary structs with length-prefixed TLV (see
-[`docs/engineering-spec.md`](docs/engineering-spec.md)). Recovering actual cell
-data is a campaign, not a single step; this file is the plan.
+(folders, workbooks/worksheets, matrices, graphs, notes) whose fixed-layout
+records sit under a run-length layer (see
+[`docs/engineering-spec.md`](docs/engineering-spec.md)). This file is the plan.
 
 Everything is built clean-room from the functional spec and the observable bytes
 of publicly published sample files, and each phase is validated against those
@@ -15,13 +14,12 @@ samples with the coverage triplet (reference observed / implemented / verified).
 
 - Container + header line (`CPYUA <format-version> <build>`) and the per-document
   root header.
-- The `0x80–0x9F` TLV record form (strings + short scalars; compact-float).
-- **Object-name inventory**: a resync walk recovers worksheet/column and
-  analysis-object names, with the new-object vs. continuation distinction —
-  verified against two samples.
 - **Stream model:** the record stream is a run-length layer over fixed-layout
-  structures (spec §2.1). Column records expand to a fixed size with the name at
-  the offset legacy `.opj` headers use.
+  structures (spec §2.1). It replaces an earlier tag-length-value reading, whose
+  "tags" were run-length tokens. Column records expand to a fixed size with the
+  name at the offset legacy `.opj` headers use.
+- **Object-name inventory**: names such as worksheet columns are recovered from
+  literal runs (spec §2.2).
 - **Header model:** the third header token is the application build, confirmed
   by the global-header version value across 98 public files.
 - **Column data:** every column payload in the public corpus parses, holding

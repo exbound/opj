@@ -3,7 +3,7 @@
 The enumerated, functional description of the Origin project-file format that
 this reader implements, and how compatibility is measured. This is a functional
 specification: it states the on-disk format as observable facts, derived by
-analysis and verified against publicly published sample files. The
+analysis and checked against publicly published sample files. The
 implementation is built from this document and the observable sample bytes
 alone.
 
@@ -11,10 +11,11 @@ alone.
   later) and the legacy `.opj`. **This repo targets `.opju` first.**
 - **Registry:** PRONOM `fmt/1124` (OPJU).
 - **Capabilities in scope:** C2 (data compatibility) — read the container,
-  recover the object inventory and document metadata. C3+ later.
+  document metadata, worksheet column values and column labels. C3+ later.
 
-Each statement is marked **[E]** established (observed and verified against real
-files), **[H]** hypothesis, or **[N]** needs-observation.
+Each statement is marked **[E]** established (observed consistently in real
+files), **[H]** hypothesis, or **[N]** needs-observation. **[E]** does not mean
+compared with the reference application; §3 states that status.
 
 ## 1. File layout
 
@@ -108,7 +109,8 @@ at most 127 bytes.
 
 ### 2.3 Numeric fields **[E]**
 
-There is no compact float encoding in this layer. A double such as `1.0` shows as
+The run-length layer has no compact float encoding of its own (column payloads
+have one, §2.6). A double such as `1.0` shows as
 `f0 3f` because its low six bytes are zero and fall inside a zero run. **[N]** the
 fields of each structure (§2.5).
 
@@ -166,8 +168,9 @@ a "continuation" tag `0x82`. Those are zero-run lengths before the name, so they
 reflect how many preceding bytes happen to be zero. **[H]** They do not mark
 objects.
 
-**[N]** the 8 descriptor bytes. Searching for the descriptor's first 10 bytes
-(`[tag] 18 18 00 00 00 00 00 00 00`) also finds coincidental matches, so `L` must
+**[N]** the 8 descriptor bytes. Searching for the record's last coded byte and
+the descriptor's first 9 bytes (`18 18 00 00 00 00 00 00 00`) also finds
+coincidental matches, so `L` must
 be validated: of 1039 candidates, 903 have payloads ending in the two bytes
 `CE FA`.
 
@@ -332,8 +335,9 @@ guess. Some parsed labels hold stray control bytes **[N]**.
   the short-decimal shares in §2.6, which compare deliberately wrong parameters
   the reader does not expose.
 - **Pass criteria (C2, initial):** the reader recovers, for each fixture, the
-  header fields (`format-version`, `build`), the root header, and the
-  object-name inventory, matching an independently recorded expected list.
+  header fields (`format-version`, `build`), the root header, and each
+  worksheet column's values, type and labels, matching an expected list
+  recorded independently with the reference application.
 - **Reference status:** no value has been compared with the reference
   application. Generating known-content files for that comparison is outstanding.
 
